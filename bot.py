@@ -940,10 +940,40 @@ def normalized_prompt(prompt: str) -> str:
 
 
 def is_project_delete_request(prompt: str) -> bool:
+    text = prompt.strip().lower()
     normalized = normalized_prompt(prompt)
     project_words = ("프로젝트", "project")
-    delete_words = ("삭제", "지워", "제거", "delete", "remove")
-    return any(word in normalized for word in project_words) and any(word in normalized for word in delete_words)
+    if not any(word in normalized for word in project_words):
+        return False
+
+    blockers = (
+        "삭제하면안",
+        "삭제하면안돼",
+        "삭제하면안되",
+        "삭제하지마",
+        "삭제하지말",
+        "삭제말고",
+        "삭제금지",
+        "지우지마",
+        "지우면안",
+        "제거하지마",
+        "제거하면안",
+        "don'tdelete",
+        "donotdelete",
+        "shouldn'tdelete",
+        "shouldnotdelete",
+        "nodelete",
+    )
+    if any(blocker in normalized for blocker in blockers):
+        return False
+
+    delete_command_patterns = [
+        r"(?:이|현재|연결된)?\s*프로젝트(?:를|을)?\s*(?:삭제|제거)\s*(?:해\s*줘|해줘|해주세요|해|하자|해라|요청|진행)",
+        r"(?:이|현재|연결된)?\s*프로젝트(?:를|을)?\s*지워\s*(?:줘|라|주세요|버려)",
+        r"(?:delete|remove)\s+(?:this\s+)?project",
+        r"project\s+(?:delete|remove)",
+    ]
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in delete_command_patterns)
 
 
 def is_project_delete_confirmation(prompt: str) -> bool:
@@ -1402,13 +1432,11 @@ def changelog_project_name(channel: discord.abc.Messageable) -> str:
     return getattr(root_channel(channel), "name", settings.workspace.name)
 
 
-def should_route_general_result_to_changelog(
+def result_looks_like_change(
     message: discord.Message,
     return_code: int,
     output: str,
 ) -> bool:
-    if not is_in_codex_category(message.channel) or not is_general_codex_channel(message.channel):
-        return False
     if return_code != 0 or "[stderr]" in output:
         return True
 
@@ -1434,6 +1462,28 @@ def should_route_general_result_to_changelog(
     )
     result_words = ("modified", "updated", "changed", "added", "removed", "수정했", "변경했", "추가했", "반영했")
     return any(word in prompt for word in change_words) or any(word in output_text for word in result_words)
+
+
+def should_record_result_to_changelog(
+    message: discord.Message,
+    return_code: int,
+    output: str,
+) -> bool:
+    if not is_in_codex_category(message.channel):
+        return False
+    if project_for_channel(message.channel):
+        return True
+    return result_looks_like_change(message, return_code, output)
+
+
+def should_route_general_result_to_changelog(
+    message: discord.Message,
+    return_code: int,
+    output: str,
+) -> bool:
+    if not is_general_codex_channel(message.channel):
+        return False
+    return should_record_result_to_changelog(message, return_code, output)
 
 
 def general_result_notice(thread: discord.Thread | None, return_code: int) -> str:
@@ -1496,6 +1546,9 @@ async def send_codex_result(
         await message.reply(general_result_notice(thread, return_code), mention_author=False)
         return
 
+    if should_record_result_to_changelog(message, return_code, output):
+        await post_codex_result_to_changelog(message, title, return_code, output)
+
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
     for index, chunk in enumerate(chunks[:MAX_REPLY_CHUNKS]):
@@ -1513,6 +1566,7 @@ async def send_codex_result_to_channel(
     return_code: int,
     output: str,
     session_id: str | None,
+    source_message: discord.Message | None = None,
 ) -> None:
     channel_id = getattr(channel, "id", None)
     if session_id and channel_id is not None:
@@ -1520,6 +1574,9 @@ async def send_codex_result_to_channel(
 
     if return_code != 0:
         output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
+
+    if source_message and should_record_result_to_changelog(source_message, return_code, output):
+        await post_codex_result_to_changelog(source_message, title, return_code, output)
 
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
@@ -1758,7 +1815,7 @@ async def codex_chat(ctx: commands.Context, *, prompt: str = "") -> None:
                 thread,
                 bridge.run_exec(thread.id, codex_prompt, image_paths=image_paths, workspace=workspace),
             )
-        await send_codex_result_to_channel(thread, "Codex", return_code, output, session_id)
+        await send_codex_result_to_channel(thread, "Codex", return_code, output, session_id, source_message=ctx.message)
 
 
 @bot.command(name="codex-chat-off")
