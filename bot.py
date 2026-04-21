@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -10,7 +11,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Awaitable, Iterable, TypeVar
 
 import aiohttp
 import discord
@@ -18,10 +19,8 @@ from discord.ext import commands
 
 
 DISCORD_MESSAGE_LIMIT = 2000
-CODE_BLOCK_OVERHEAD = len("```text\n\n```")
 MAX_REPLY_CHUNKS = 6
-
-
+T = TypeVar("T")
 def load_dotenv(path: Path) -> None:
     if not path.exists():
         return
@@ -49,10 +48,31 @@ def env_list(name: str) -> set[int]:
     return ids
 
 
+def env_text_list(name: str, default: str = "") -> list[str]:
+    value = os.environ.get(name, default).strip()
+    if not value:
+        return []
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
 def env_int(name: str, default: int) -> int:
     value = os.environ.get(name, "").strip()
     if not value:
         return default
+    return int(value)
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    if not value:
+        return default
+    return value not in {"0", "false", "no", "off"}
+
+
+def env_optional_int(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
     return int(value)
 
 
@@ -79,9 +99,11 @@ def split_text(text: str, limit: int) -> list[str]:
     return chunks
 
 
-def as_code_blocks(text: str) -> list[str]:
-    safe = text.replace("```", "`\u200b``")
-    return [f"```text\n{chunk}\n```" for chunk in split_text(safe, DISCORD_MESSAGE_LIMIT - CODE_BLOCK_OVERHEAD)]
+def as_discord_messages(text: str) -> list[str]:
+    clean = text.strip()
+    if not clean:
+        clean = "(응답이 비어 있어요.)"
+    return split_text(clean, DISCORD_MESSAGE_LIMIT - 50)
 
 
 def parse_session_id(line: str) -> str | None:
@@ -139,8 +161,16 @@ class Settings:
     max_parallel_jobs: int
     allowed_channel_ids: set[int]
     allowed_role_ids: set[int]
+    codex_category_id: int | None
+    codex_category_name: str
+    general_channel_names: list[str]
+    category_chat_enabled: bool
     mention_chat_enabled: bool
     thread_chat_enabled: bool
+    wake_words: list[str]
+    instant_replies_enabled: bool
+    slow_notice_enabled: bool
+    slow_notice_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -161,8 +191,16 @@ class Settings:
             max_parallel_jobs=max(1, env_int("MAX_PARALLEL_CODEX_JOBS", 1)),
             allowed_channel_ids=env_list("DISCORD_ALLOWED_CHANNEL_IDS"),
             allowed_role_ids=env_list("DISCORD_ALLOWED_ROLE_IDS"),
-            mention_chat_enabled=os.environ.get("MENTION_CHAT_ENABLED", "true").strip().lower() != "false",
-            thread_chat_enabled=os.environ.get("THREAD_CHAT_ENABLED", "true").strip().lower() != "false",
+            codex_category_id=env_optional_int("DISCORD_CODEX_CATEGORY_ID"),
+            codex_category_name=os.environ.get("DISCORD_CODEX_CATEGORY_NAME", "Codex").strip(),
+            general_channel_names=env_text_list("CODEX_GENERAL_CHANNEL_NAMES", "codex"),
+            category_chat_enabled=env_bool("CATEGORY_CHAT_ENABLED", True),
+            mention_chat_enabled=env_bool("MENTION_CHAT_ENABLED", True),
+            thread_chat_enabled=env_bool("THREAD_CHAT_ENABLED", True),
+            wake_words=env_text_list("WAKE_WORDS", "코덱스야,코덱스"),
+            instant_replies_enabled=env_bool("INSTANT_REPLIES_ENABLED", True),
+            slow_notice_enabled=env_bool("SLOW_NOTICE_ENABLED", True),
+            slow_notice_seconds=max(1, env_int("SLOW_NOTICE_SECONDS", 12)),
         )
 
 
@@ -372,35 +410,127 @@ intents.message_content = True
 bot = commands.Bot(command_prefix=settings.prefix, intents=intents, help_command=None)
 
 
-async def is_allowed(ctx: commands.Context) -> bool:
-    if settings.allowed_channel_ids and ctx.channel.id not in settings.allowed_channel_ids:
-        await ctx.reply("이 채널에서는 Codex 봇을 사용할 수 없어요.", mention_author=False)
+def normalize_discord_name(value: str) -> str:
+    return value.strip().casefold()
+
+
+def root_channel(channel: discord.abc.Messageable) -> discord.abc.Messageable:
+    parent = getattr(channel, "parent", None)
+    if isinstance(channel, discord.Thread) and parent is not None:
+        return parent
+    return channel
+
+
+def channel_category(channel: discord.abc.Messageable) -> discord.CategoryChannel | None:
+    category = getattr(root_channel(channel), "category", None)
+    if isinstance(category, discord.CategoryChannel):
+        return category
+    return None
+
+
+def channel_acl_ids(channel: discord.abc.Messageable) -> set[int]:
+    ids: set[int] = set()
+    channel_id = getattr(channel, "id", None)
+    if isinstance(channel_id, int):
+        ids.add(channel_id)
+
+    parent = getattr(channel, "parent", None)
+    parent_id = getattr(parent, "id", None)
+    if isinstance(parent_id, int):
+        ids.add(parent_id)
+
+    category = channel_category(channel)
+    if category:
+        ids.add(category.id)
+
+    return ids
+
+
+def is_in_codex_category(channel: discord.abc.Messageable) -> bool:
+    if not settings.codex_category_id and not settings.codex_category_name:
+        return True
+
+    category = channel_category(channel)
+    if not category:
         return False
 
-    if settings.allowed_role_ids and isinstance(ctx.author, discord.Member):
-        member_role_ids = {role.id for role in ctx.author.roles}
-        if not member_role_ids.intersection(settings.allowed_role_ids):
-            await ctx.reply("이 명령을 실행할 역할 권한이 없어요.", mention_author=False)
-            return False
+    if settings.codex_category_id:
+        return category.id == settings.codex_category_id
 
-    return True
+    return normalize_discord_name(category.name) == normalize_discord_name(settings.codex_category_name)
 
 
-async def send_codex_result(ctx: commands.Context, title: str, return_code: int, output: str, session_id: str | None) -> None:
-    status = "완료" if return_code == 0 else f"종료 코드 {return_code}"
-    header = f"{title} {status}"
-    if session_id:
-        session_store.set(ctx.channel.id, session_id)
-        header += f"\n세션: `{session_id}`"
+def is_general_codex_channel(channel: discord.abc.Messageable) -> bool:
+    names = {normalize_discord_name(name) for name in settings.general_channel_names}
+    channel_name = getattr(root_channel(channel), "name", "")
+    return bool(channel_name) and normalize_discord_name(channel_name) in names
 
-    await ctx.reply(header, mention_author=False)
 
-    blocks = as_code_blocks(output)
-    truncated = len(blocks) > MAX_REPLY_CHUNKS
-    for block in blocks[:MAX_REPLY_CHUNKS]:
-        await ctx.send(block)
-    if truncated:
-        await ctx.send("출력이 길어서 Discord에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.")
+def channel_context_prompt(message: discord.Message, prompt: str) -> str:
+    if not is_in_codex_category(message.channel):
+        return prompt
+
+    category = channel_category(message.channel)
+    category_name = category.name if category else settings.codex_category_name
+    parent_channel = root_channel(message.channel)
+    channel_name = getattr(parent_channel, "name", str(getattr(parent_channel, "id", "unknown")))
+
+    if is_general_codex_channel(message.channel):
+        context = (
+            f"Discord context: This message is from #{channel_name} in the {category_name} category. "
+            "Treat it as the general Codex channel where the user may ask about anything."
+        )
+    else:
+        context = (
+            f"Discord context: This message is from project channel #{channel_name} "
+            f"in the {category_name} category. Treat this channel as a persistent project named "
+            f"{channel_name}; keep project-specific context, decisions, and follow-up work scoped to it."
+        )
+
+    if isinstance(message.channel, discord.Thread):
+        context += f" Thread: {message.channel.name}."
+
+    return f"{context}\n\nUser message:\n{prompt}"
+
+
+def normalized_prompt(prompt: str) -> str:
+    stripped = prompt.strip().lower()
+    stripped = stripped.strip(" \t\r\n,，.。!！?？:：;；~")
+    return re.sub(r"\s+", "", stripped)
+
+
+def instant_reply(message: discord.Message, prompt: str) -> str | None:
+    if not settings.instant_replies_enabled or message.attachments:
+        return None
+
+    normalized = normalized_prompt(prompt)
+    if normalized in {"안녕", "안녕하세요", "하이", "ㅎㅇ", "hello", "hi"}:
+        return "안녕하세요. 어떤 작업부터 같이 볼까요?"
+
+    if normalized in {"도움", "도움말", "사용법", "명령어", "뭐할수있어", "뭘할수있어"}:
+        prefix = settings.prefix
+        return "\n".join(
+            [
+                "이렇게 말하면 돼요.",
+                f"`코덱스야 <요청>`: 바로 대화하기",
+                f"`{prefix}codex <요청>`: 새 작업 맡기기",
+                f"`{prefix}codex-chat <요청>`: 대화용 스레드 열기",
+                f"`{prefix}codex-status`: 현재 상태 보기",
+            ]
+        )
+
+    if normalized in {"상태", "상태확인", "status"}:
+        active = message.channel.id in bridge.active_processes
+        session_id = session_store.get(message.channel.id)
+        return "\n".join(
+            [
+                f"작업 폴더: `{settings.workspace}`",
+                f"실행 중: `{'yes' if active else 'no'}`",
+                f"저장된 세션: `{session_id or 'none'}`",
+            ]
+        )
+
+    return None
 
 
 def author_has_allowed_role(author: discord.abc.User) -> bool:
@@ -413,7 +543,11 @@ def author_has_allowed_role(author: discord.abc.User) -> bool:
 
 
 async def is_allowed_message(message: discord.Message) -> bool:
-    if settings.allowed_channel_ids and message.channel.id not in settings.allowed_channel_ids:
+    if not is_in_codex_category(message.channel):
+        await message.reply("Codex 카테고리 안의 채널에서만 사용할 수 있어요.", mention_author=False)
+        return False
+
+    if settings.allowed_channel_ids and not channel_acl_ids(message.channel).intersection(settings.allowed_channel_ids):
         await message.reply("이 채널에서는 Codex 봇을 사용할 수 없어요.", mention_author=False)
         return False
 
@@ -428,6 +562,31 @@ async def is_allowed(ctx: commands.Context) -> bool:
     return await is_allowed_message(ctx.message)
 
 
+async def send_slow_notice(anchor: discord.Message | discord.abc.Messageable) -> None:
+    if not settings.slow_notice_enabled:
+        return
+
+    await asyncio.sleep(settings.slow_notice_seconds)
+    text = "확인할 내용이 많아서 조금 더 걸릴 수 있어요."
+    if isinstance(anchor, discord.Message):
+        await anchor.reply(text, mention_author=False)
+    else:
+        await anchor.send(text)
+
+
+async def run_with_slow_notice(
+    anchor: discord.Message | discord.abc.Messageable,
+    awaitable: Awaitable[T],
+) -> T:
+    notice_task = asyncio.create_task(send_slow_notice(anchor))
+    try:
+        return await awaitable
+    finally:
+        notice_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await notice_task
+
+
 async def send_codex_result(
     anchor: commands.Context | discord.Message,
     title: str,
@@ -436,18 +595,19 @@ async def send_codex_result(
     session_id: str | None,
 ) -> None:
     message = anchor.message if isinstance(anchor, commands.Context) else anchor
-    status = "완료" if return_code == 0 else f"종료 코드 {return_code}"
-    header = f"{title} {status}"
     if session_id:
         session_store.set(message.channel.id, session_id)
-        header += f"\n세션: `{session_id}`"
 
-    await message.reply(header, mention_author=False)
+    if return_code != 0:
+        output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
 
-    blocks = as_code_blocks(output)
-    truncated = len(blocks) > MAX_REPLY_CHUNKS
-    for block in blocks[:MAX_REPLY_CHUNKS]:
-        await message.channel.send(block)
+    chunks = as_discord_messages(output)
+    truncated = len(chunks) > MAX_REPLY_CHUNKS
+    for index, chunk in enumerate(chunks[:MAX_REPLY_CHUNKS]):
+        if index == 0:
+            await message.reply(chunk, mention_author=False)
+        else:
+            await message.channel.send(chunk)
     if truncated:
         await message.channel.send("출력이 길어서 Discord에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.")
 
@@ -459,19 +619,17 @@ async def send_codex_result_to_channel(
     output: str,
     session_id: str | None,
 ) -> None:
-    status = "완료" if return_code == 0 else f"종료 코드 {return_code}"
-    header = f"{title} {status}"
     channel_id = getattr(channel, "id", None)
     if session_id and channel_id is not None:
         session_store.set(channel_id, session_id)
-        header += f"\n세션: `{session_id}`"
 
-    await channel.send(header)
+    if return_code != 0:
+        output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
 
-    blocks = as_code_blocks(output)
-    truncated = len(blocks) > MAX_REPLY_CHUNKS
-    for block in blocks[:MAX_REPLY_CHUNKS]:
-        await channel.send(block)
+    chunks = as_discord_messages(output)
+    truncated = len(chunks) > MAX_REPLY_CHUNKS
+    for chunk in chunks[:MAX_REPLY_CHUNKS]:
+        await channel.send(chunk)
     if truncated:
         await channel.send("출력이 길어서 Discord에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.")
 
@@ -484,23 +642,35 @@ async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_sess
     if not await is_allowed_message(message):
         return
 
+    quick = instant_reply(message, prompt)
+    if quick:
+        await message.reply(quick, mention_author=False)
+        return
+
     session_id = None if force_new_session else session_store.get(message.channel.id)
     image_paths = await bridge.save_attachments(message)
+    codex_prompt = channel_context_prompt(message, prompt)
 
     async with message.channel.typing():
         if session_id:
-            return_code, output, new_session_id = await bridge.run_exec(
-                message.channel.id,
-                prompt,
-                resume_session_id=session_id,
-                image_paths=image_paths,
+            return_code, output, new_session_id = await run_with_slow_notice(
+                message,
+                bridge.run_exec(
+                    message.channel.id,
+                    codex_prompt,
+                    resume_session_id=session_id,
+                    image_paths=image_paths,
+                ),
             )
             await send_codex_result(message, "Codex", return_code, output, new_session_id or session_id)
         else:
-            return_code, output, new_session_id = await bridge.run_exec(
-                message.channel.id,
-                prompt,
-                image_paths=image_paths,
+            return_code, output, new_session_id = await run_with_slow_notice(
+                message,
+                bridge.run_exec(
+                    message.channel.id,
+                    codex_prompt,
+                    image_paths=image_paths,
+                ),
             )
             await send_codex_result(message, "Codex", return_code, output, new_session_id)
 
@@ -511,9 +681,29 @@ def strip_bot_mention(content: str) -> str:
     return re.sub(rf"<@!?{bot.user.id}>", "", content).strip()
 
 
+def strip_wake_word(content: str) -> str | None:
+    text = content.strip()
+    text_lower = text.lower()
+
+    for wake_word in settings.wake_words:
+        wake_word_lower = wake_word.lower()
+        if text_lower == wake_word_lower:
+            return ""
+        if not text_lower.startswith(wake_word_lower):
+            continue
+
+        rest = text[len(wake_word) :]
+        if rest and rest[0] not in " \t\r\n,，.。!！?？:：;；~":
+            continue
+        return rest.lstrip(" \t\r\n,，.。!！?？:：;；~")
+
+    return None
+
+
 @bot.event
 async def on_ready() -> None:
-    print(f"Logged in as {bot.user} | workspace={settings.workspace}")
+    category = settings.codex_category_id or settings.codex_category_name or "all"
+    print(f"Logged in as {bot.user} | workspace={settings.workspace} | category={category}")
 
 
 @bot.event
@@ -530,6 +720,15 @@ async def on_message(message: discord.Message) -> None:
         await run_chat_turn(message, strip_bot_mention(message.content))
         return
 
+    wake_prompt = strip_wake_word(message.content)
+    if wake_prompt is not None:
+        await run_chat_turn(message, wake_prompt)
+        return
+
+    if settings.category_chat_enabled and is_in_codex_category(message.channel):
+        await run_chat_turn(message, message.content)
+        return
+
     if settings.thread_chat_enabled and chat_channel_store.contains(message.channel.id):
         await run_chat_turn(message, message.content)
 
@@ -543,8 +742,12 @@ async def codex_command(ctx: commands.Context, *, prompt: str = "") -> None:
         return
 
     image_paths = await bridge.save_attachments(ctx.message)
-    await ctx.reply("Codex 작업을 시작했어요. 끝나면 이 채널에 결과를 올릴게요.", mention_author=False)
-    return_code, output, session_id = await bridge.run_exec(ctx.channel.id, prompt, image_paths=image_paths)
+    codex_prompt = channel_context_prompt(ctx.message, prompt)
+    async with ctx.channel.typing():
+        return_code, output, session_id = await run_with_slow_notice(
+            ctx.message,
+            bridge.run_exec(ctx.channel.id, codex_prompt, image_paths=image_paths),
+        )
     await send_codex_result(ctx, "Codex 작업", return_code, output, session_id)
 
 
@@ -580,9 +783,13 @@ async def codex_chat(ctx: commands.Context, *, prompt: str = "") -> None:
     await thread.send("채팅 모드를 시작했어요. 여기서는 명령어 없이 바로 말하면 Codex가 이어서 답합니다.")
     if prompt.strip():
         image_paths = await bridge.save_attachments(ctx.message)
+        codex_prompt = channel_context_prompt(ctx.message, prompt)
         async with thread.typing():
-            return_code, output, session_id = await bridge.run_exec(thread.id, prompt, image_paths=image_paths)
-            await send_codex_result_to_channel(thread, "Codex", return_code, output, session_id)
+            return_code, output, session_id = await run_with_slow_notice(
+                thread,
+                bridge.run_exec(thread.id, codex_prompt, image_paths=image_paths),
+            )
+        await send_codex_result_to_channel(thread, "Codex", return_code, output, session_id)
 
 
 @bot.command(name="codex-chat-off")
@@ -607,13 +814,17 @@ async def codex_continue(ctx: commands.Context, *, prompt: str = "") -> None:
         return
 
     image_paths = await bridge.save_attachments(ctx.message)
-    await ctx.reply(f"저장된 세션 `{session_id}`에 이어서 요청할게요.", mention_author=False)
-    return_code, output, new_session_id = await bridge.run_exec(
-        ctx.channel.id,
-        prompt,
-        resume_session_id=session_id,
-        image_paths=image_paths,
-    )
+    codex_prompt = channel_context_prompt(ctx.message, prompt)
+    async with ctx.channel.typing():
+        return_code, output, new_session_id = await run_with_slow_notice(
+            ctx.message,
+            bridge.run_exec(
+                ctx.channel.id,
+                codex_prompt,
+                resume_session_id=session_id,
+                image_paths=image_paths,
+            ),
+        )
     await send_codex_result(ctx, "Codex 이어하기", return_code, output, new_session_id or session_id)
 
 
@@ -632,13 +843,17 @@ async def codex_resume(ctx: commands.Context, session_id_or_url: str = "", *, pr
         return
 
     image_paths = await bridge.save_attachments(ctx.message)
-    await ctx.reply(f"세션 `{session_id}`를 이어서 실행할게요.", mention_author=False)
-    return_code, output, new_session_id = await bridge.run_exec(
-        ctx.channel.id,
-        prompt,
-        resume_session_id=session_id,
-        image_paths=image_paths,
-    )
+    codex_prompt = channel_context_prompt(ctx.message, prompt)
+    async with ctx.channel.typing():
+        return_code, output, new_session_id = await run_with_slow_notice(
+            ctx.message,
+            bridge.run_exec(
+                ctx.channel.id,
+                codex_prompt,
+                resume_session_id=session_id,
+                image_paths=image_paths,
+            ),
+        )
     await send_codex_result(ctx, "Codex 세션 재개", return_code, output, new_session_id or session_id)
 
 
@@ -647,8 +862,11 @@ async def codex_review(ctx: commands.Context, *, prompt: str = "") -> None:
     if not await is_allowed(ctx):
         return
 
-    await ctx.reply("현재 작업 트리 기준으로 Codex 리뷰를 시작할게요.", mention_author=False)
-    return_code, output, _ = await bridge.run_review(ctx.channel.id, prompt.strip())
+    async with ctx.channel.typing():
+        return_code, output, _ = await run_with_slow_notice(
+            ctx.message,
+            bridge.run_review(ctx.channel.id, prompt.strip()),
+        )
     await send_codex_result(ctx, "Codex 리뷰", return_code, output, None)
 
 
@@ -667,8 +885,17 @@ async def codex_cancel(ctx: commands.Context) -> None:
 async def codex_status(ctx: commands.Context) -> None:
     active = ctx.channel.id in bridge.active_processes
     session_id = session_store.get(ctx.channel.id)
+    category = channel_category(ctx.channel)
+    if is_in_codex_category(ctx.channel) and is_general_codex_channel(ctx.channel):
+        channel_mode = "general"
+    elif is_in_codex_category(ctx.channel):
+        channel_mode = "project"
+    else:
+        channel_mode = "outside-codex-category"
     lines = [
         f"작업 폴더: `{settings.workspace}`",
+        f"Codex 카테고리: `{category.name if category else 'none'}`",
+        f"채널 모드: `{channel_mode}`",
         f"실행 중: `{'yes' if active else 'no'}`",
         f"저장된 세션: `{session_id or 'none'}`",
     ]
@@ -695,6 +922,10 @@ async def codex_help(ctx: commands.Context) -> None:
             "`@봇 요청`: 명령어 없이 바로 Codex에게 요청",
         ]
     )
+    text += "\n`코덱스야 요청`: 멘션 없이 Codex에게 요청"
+    text += "\n\nCodex 카테고리 안에서는 명령어 없이 바로 대화할 수 있어요."
+    text += "\n`#codex`: 일반 질문 채널"
+    text += "\n그 외 Codex 카테고리 채널: 채널별 프로젝트"
     await ctx.reply(text, mention_author=False)
 
 
