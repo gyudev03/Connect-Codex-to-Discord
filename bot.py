@@ -542,6 +542,7 @@ project_store = ProjectStore(Path("data") / "projects.json")
 pending_project_deletes: dict[int, PendingProjectDelete] = {}
 pending_git_actions: dict[int, PendingGitAction] = {}
 GIT_CONFIRM_EMOJI = "✅"
+GIT_CANCEL_EMOJI = "❌"
 DEFAULT_COMMIT_MESSAGE = "update from Discord Codex"
 bridge = CodexBridge(settings, session_store)
 
@@ -1348,13 +1349,14 @@ async def request_git_action(message: discord.Message, action: str, commit_messa
                 "",
                 "변경사항:",
                 f"```text\n{status_preview}\n```",
-                f"{GIT_CONFIRM_EMOJI} 반응을 누르면 진행합니다.",
+                f"{GIT_CONFIRM_EMOJI} 반응을 누르면 진행하고, {GIT_CANCEL_EMOJI} 반응을 누르면 취소합니다.",
             ]
         ),
         mention_author=False,
     )
     try:
         await confirm_message.add_reaction(GIT_CONFIRM_EMOJI)
+        await confirm_message.add_reaction(GIT_CANCEL_EMOJI)
     except discord.HTTPException:
         await confirm_message.reply("확인 이모지를 달지 못했어요. 봇의 반응 추가 권한을 확인해 주세요.", mention_author=False)
         return
@@ -1423,6 +1425,17 @@ async def execute_pending_git_action(reaction: discord.Reaction, user: discord.a
 
     prefix = "완료했어요." if ok else "실패했어요."
     await reaction.message.reply(f"{prefix}\n{text}", mention_author=False)
+
+
+async def cancel_pending_git_action(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    pending = pending_git_actions.pop(reaction.message.id, None)
+    if not pending:
+        return
+    if user.id != pending.requested_by_id:
+        pending_git_actions[reaction.message.id] = pending
+        return
+
+    await reaction.message.reply("커밋/푸시 요청을 취소했어요.", mention_author=False)
 
 
 def changelog_project_name(channel: discord.abc.Messageable) -> str:
@@ -1521,6 +1534,34 @@ async def post_general_stderr_to_changelog(
     return f"(stderr output was posted to {thread.mention}.)", thread
 
 
+async def record_codex_result_and_prepare_reply(
+    message: discord.Message,
+    title: str,
+    return_code: int,
+    output: str,
+) -> str:
+    if not should_record_result_to_changelog(message, return_code, output):
+        return output
+
+    visible_output, stderr_output = split_stderr_section(output)
+    thread = await post_codex_result_to_changelog(message, title, return_code, output)
+
+    if not stderr_output:
+        return output
+
+    if visible_output:
+        if thread is None:
+            return (
+                f"{visible_output}\n\n"
+                f"stderr 로그를 {settings.changelog_forum_name} 포럼에 기록하지 못했어요."
+            )
+        return visible_output
+
+    if thread is not None:
+        return f"자세한 실행 로그는 {thread.mention}에 기록했어요."
+    return f"stderr 로그를 {settings.changelog_forum_name} 포럼에 기록하지 못했어요."
+
+
 async def post_codex_result_to_changelog(
     message: discord.Message,
     title: str,
@@ -1569,10 +1610,7 @@ async def send_codex_result(
     if return_code != 0:
         output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
 
-    if should_route_general_result_to_changelog(message, return_code, output):
-        output, _ = await post_general_stderr_to_changelog(message, title, return_code, output)
-    elif should_record_result_to_changelog(message, return_code, output):
-        await post_codex_result_to_changelog(message, title, return_code, output)
+    output = await record_codex_result_and_prepare_reply(message, title, return_code, output)
 
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
@@ -1601,10 +1639,7 @@ async def send_codex_result_to_channel(
         output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
 
     if source_message:
-        if should_route_general_result_to_changelog(source_message, return_code, output):
-            output, _ = await post_general_stderr_to_changelog(source_message, title, return_code, output)
-        elif should_record_result_to_changelog(source_message, return_code, output):
-            await post_codex_result_to_changelog(source_message, title, return_code, output)
+        output = await record_codex_result_and_prepare_reply(source_message, title, return_code, output)
 
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
@@ -1691,9 +1726,14 @@ async def on_ready() -> None:
 
 @bot.event
 async def on_reaction_add(reaction: discord.Reaction, user: discord.abc.User) -> None:
-    if user.bot or str(reaction.emoji) != GIT_CONFIRM_EMOJI:
+    if user.bot:
         return
-    await execute_pending_git_action(reaction, user)
+
+    emoji = str(reaction.emoji)
+    if emoji == GIT_CONFIRM_EMOJI:
+        await execute_pending_git_action(reaction, user)
+    elif emoji == GIT_CANCEL_EMOJI:
+        await cancel_pending_git_action(reaction, user)
 
 
 @bot.event
