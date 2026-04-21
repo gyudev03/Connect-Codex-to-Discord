@@ -1068,6 +1068,7 @@ async def request_project_delete(message: discord.Message) -> None:
                 f"채널: {project_channel.mention}",
                 f"경로: `{project.path}`",
                 "5분 안에 같은 사용자가 `삭제 확인`이라고 보내면 Discord 채널과 로컬 프로젝트 폴더를 삭제합니다.",
+                f"`{settings.changelog_forum_name}` 포럼의 프로젝트 수정내역 포스트는 삭제하지 않습니다.",
             ]
         ),
         mention_author=False,
@@ -1113,7 +1114,7 @@ async def confirm_project_delete(message: discord.Message) -> None:
         return
 
     await message.reply(
-        f"`{project.name}` 프로젝트 삭제를 시작합니다. 완료되면 이 채널도 삭제됩니다.",
+        f"`{project.name}` 프로젝트 삭제를 시작합니다. 완료되면 이 채널도 삭제됩니다. 수정내역 포스트는 유지합니다.",
         mention_author=False,
     )
 
@@ -1124,6 +1125,7 @@ async def confirm_project_delete(message: discord.Message) -> None:
         await message.channel.send(f"프로젝트 폴더 삭제에 실패해서 채널 삭제를 중단했어요.\n경로: `{project.path}`\n{exc}")
         return
 
+    # Keep changelog_thread_store untouched so changelog forum posts survive project deletion.
     project_store.remove(project.channel_id)
     chat_channel_store.remove(project.channel_id)
     session_store.remove(project.channel_id)
@@ -1476,6 +1478,17 @@ def should_record_result_to_changelog(
     return result_looks_like_change(message, return_code, output)
 
 
+def split_stderr_section(output: str) -> tuple[str, str | None]:
+    matches = list(re.finditer(r"(?im)(?:^|\n)\[stderr\][ \t]*\r?\n?", output))
+    if not matches:
+        return output, None
+
+    match = matches[-1]
+    visible = output[: match.start()].rstrip()
+    stderr = output[match.end() :].strip()
+    return visible, stderr or None
+
+
 def should_route_general_result_to_changelog(
     message: discord.Message,
     return_code: int,
@@ -1486,11 +1499,26 @@ def should_route_general_result_to_changelog(
     return should_record_result_to_changelog(message, return_code, output)
 
 
-def general_result_notice(thread: discord.Thread | None, return_code: int) -> str:
-    status = "오류 상세" if return_code != 0 else "작업 상세"
-    if thread:
-        return f"{status}는 {thread.mention}에 올렸어요."
-    return f"{status}는 일반 `codex` 채널에 길게 올리지 않았어요. `{settings.changelog_forum_name}` 포럼을 찾거나 쓸 수 있는지 확인해 주세요."
+async def post_general_stderr_to_changelog(
+    message: discord.Message,
+    title: str,
+    return_code: int,
+    output: str,
+) -> tuple[str, discord.Thread | None]:
+    if not should_route_general_result_to_changelog(message, return_code, output):
+        return output, None
+
+    visible_output, stderr_output = split_stderr_section(output)
+    if not stderr_output:
+        return output, None
+
+    thread = await post_codex_result_to_changelog(message, f"{title} stderr", return_code, stderr_output)
+    if thread is None:
+        return output, None
+
+    if visible_output:
+        return visible_output, thread
+    return f"(stderr output was posted to {thread.mention}.)", thread
 
 
 async def post_codex_result_to_changelog(
@@ -1542,11 +1570,8 @@ async def send_codex_result(
         output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
 
     if should_route_general_result_to_changelog(message, return_code, output):
-        thread = await post_codex_result_to_changelog(message, title, return_code, output)
-        await message.reply(general_result_notice(thread, return_code), mention_author=False)
-        return
-
-    if should_record_result_to_changelog(message, return_code, output):
+        output, _ = await post_general_stderr_to_changelog(message, title, return_code, output)
+    elif should_record_result_to_changelog(message, return_code, output):
         await post_codex_result_to_changelog(message, title, return_code, output)
 
     chunks = as_discord_messages(output)
@@ -1575,8 +1600,11 @@ async def send_codex_result_to_channel(
     if return_code != 0:
         output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
 
-    if source_message and should_record_result_to_changelog(source_message, return_code, output):
-        await post_codex_result_to_changelog(source_message, title, return_code, output)
+    if source_message:
+        if should_route_general_result_to_changelog(source_message, return_code, output):
+            output, _ = await post_general_stderr_to_changelog(source_message, title, return_code, output)
+        elif should_record_result_to_changelog(source_message, return_code, output):
+            await post_codex_result_to_changelog(source_message, title, return_code, output)
 
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
