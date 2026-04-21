@@ -6,9 +6,11 @@ import json
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Iterable, TypeVar
@@ -20,6 +22,7 @@ from discord.ext import commands
 
 DISCORD_MESSAGE_LIMIT = 2000
 MAX_REPLY_CHUNKS = 6
+PROJECT_DELETE_CONFIRM_SECONDS = 300
 T = TypeVar("T")
 def load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -229,6 +232,10 @@ class SessionStore:
         self._data[str(channel_id)] = session_id
         self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def remove(self, channel_id: int) -> None:
+        self._data.pop(str(channel_id), None)
+        self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 class ChatChannelStore:
     def __init__(self, path: Path) -> None:
@@ -265,6 +272,13 @@ class Project:
     name: str
     slug: str
     path: Path
+
+
+@dataclass
+class PendingProjectDelete:
+    project: Project
+    requested_by_id: int
+    created_at: float
 
 
 class ProjectStore:
@@ -308,6 +322,10 @@ class ProjectStore:
             "slug": project.slug,
             "path": str(project.path),
         }
+        self.save()
+
+    def remove(self, channel_id: int) -> None:
+        self._data.pop(str(channel_id), None)
         self.save()
 
     def find_by_slug(self, slug: str) -> Project | None:
@@ -474,6 +492,7 @@ settings = Settings.from_env()
 session_store = SessionStore(Path("data") / "sessions.json")
 chat_channel_store = ChatChannelStore(Path("data") / "chat_channels.json")
 project_store = ProjectStore(Path("data") / "projects.json")
+pending_project_deletes: dict[int, PendingProjectDelete] = {}
 bridge = CodexBridge(settings, session_store)
 
 intents = discord.Intents.default()
@@ -781,6 +800,188 @@ def normalized_prompt(prompt: str) -> str:
     return re.sub(r"\s+", "", stripped)
 
 
+def is_project_delete_request(prompt: str) -> bool:
+    normalized = normalized_prompt(prompt)
+    project_words = ("프로젝트", "project")
+    delete_words = ("삭제", "지워", "제거", "delete", "remove")
+    return any(word in normalized for word in project_words) and any(word in normalized for word in delete_words)
+
+
+def is_project_delete_confirmation(prompt: str) -> bool:
+    normalized = normalized_prompt(prompt)
+    return normalized in {
+        "삭제확인",
+        "프로젝트삭제확인",
+        "확인",
+        "yes",
+        "y",
+        "confirm",
+        "deleteconfirm",
+        "confirmdelete",
+    }
+
+
+def is_explicit_project_delete_confirmation(prompt: str) -> bool:
+    normalized = normalized_prompt(prompt)
+    return normalized in {
+        "삭제확인",
+        "프로젝트삭제확인",
+        "deleteconfirm",
+        "confirmdelete",
+    }
+
+
+def is_safe_project_delete_path(path: Path) -> bool:
+    try:
+        resolved = path.expanduser().resolve()
+        projects_root = settings.projects_root.expanduser().resolve()
+        resolved.relative_to(projects_root)
+    except (OSError, ValueError):
+        return False
+    return resolved != projects_root
+
+
+def current_project_text_channel(channel: discord.abc.Messageable) -> discord.TextChannel | None:
+    root = root_channel(channel)
+    if isinstance(root, discord.TextChannel):
+        return root
+    return None
+
+
+def pending_delete_for_channel(channel: discord.abc.Messageable) -> PendingProjectDelete | None:
+    root = current_project_text_channel(channel)
+    if root is None:
+        return None
+    pending = pending_project_deletes.get(root.id)
+    if pending is None:
+        return None
+    if time.monotonic() - pending.created_at > PROJECT_DELETE_CONFIRM_SECONDS:
+        pending_project_deletes.pop(root.id, None)
+        return None
+    return pending
+
+
+async def request_project_delete(message: discord.Message) -> None:
+    if not await is_allowed_message(message):
+        return
+
+    project = project_for_channel(message.channel)
+    project_channel = current_project_text_channel(message.channel)
+    if not project or not project_channel or is_general_codex_channel(message.channel):
+        await message.reply("프로젝트 삭제는 연결된 프로젝트 채널 안에서만 요청할 수 있어요.", mention_author=False)
+        return
+
+    if project.channel_id in bridge.active_processes:
+        await message.reply(
+            f"이 프로젝트 채널에서 실행 중인 Codex 작업이 있어요. 먼저 `{settings.prefix}codex-cancel`로 중단한 뒤 다시 요청해 주세요.",
+            mention_author=False,
+        )
+        return
+
+    if not is_safe_project_delete_path(project.path):
+        await message.reply(
+            f"안전하지 않은 프로젝트 경로라서 삭제하지 않을게요.\n경로: `{project.path}`\n"
+            f"삭제 가능한 경로는 `{settings.projects_root}` 아래여야 합니다.",
+            mention_author=False,
+        )
+        return
+
+    pending_project_deletes[project_channel.id] = PendingProjectDelete(
+        project=project,
+        requested_by_id=message.author.id,
+        created_at=time.monotonic(),
+    )
+    await message.reply(
+        "\n".join(
+            [
+                "프로젝트 삭제 확인이 필요합니다.",
+                f"프로젝트: `{project.name}`",
+                f"채널: {project_channel.mention}",
+                f"경로: `{project.path}`",
+                "5분 안에 같은 사용자가 `삭제 확인`이라고 보내면 Discord 채널과 로컬 프로젝트 폴더를 삭제합니다.",
+            ]
+        ),
+        mention_author=False,
+    )
+
+
+async def confirm_project_delete(message: discord.Message) -> None:
+    if not await is_allowed_message(message):
+        return
+
+    pending = pending_delete_for_channel(message.channel)
+    if pending is None:
+        await message.reply("확인 대기 중인 프로젝트 삭제 요청이 없어요.", mention_author=False)
+        return
+
+    if pending.requested_by_id != message.author.id:
+        await message.reply("삭제를 요청한 같은 사용자만 확인할 수 있어요.", mention_author=False)
+        return
+
+    project = pending.project
+    project_channel = current_project_text_channel(message.channel)
+    if not project_channel or project_channel.id != project.channel_id:
+        await message.reply("프로젝트 채널을 확인하지 못해서 삭제를 중단했어요.", mention_author=False)
+        return
+
+    if project.channel_id in bridge.active_processes:
+        await message.reply(
+            f"이 프로젝트 채널에서 실행 중인 Codex 작업이 있어요. 먼저 `{settings.prefix}codex-cancel`로 중단한 뒤 다시 요청해 주세요.",
+            mention_author=False,
+        )
+        return
+
+    if not is_safe_project_delete_path(project.path):
+        await message.reply(
+            f"안전하지 않은 프로젝트 경로라서 삭제하지 않을게요.\n경로: `{project.path}`",
+            mention_author=False,
+        )
+        return
+
+    member = message.guild.me if message.guild else None
+    if member and not project_channel.permissions_for(member).manage_channels:
+        await message.reply("채널을 삭제할 권한이 없어요. 봇에 Manage Channels 권한을 추가해 주세요.", mention_author=False)
+        return
+
+    await message.reply(
+        f"`{project.name}` 프로젝트 삭제를 시작합니다. 완료되면 이 채널도 삭제됩니다.",
+        mention_author=False,
+    )
+
+    try:
+        if project.path.exists():
+            await asyncio.to_thread(shutil.rmtree, project.path)
+    except OSError as exc:
+        await message.channel.send(f"프로젝트 폴더 삭제에 실패해서 채널 삭제를 중단했어요.\n경로: `{project.path}`\n{exc}")
+        return
+
+    project_store.remove(project.channel_id)
+    chat_channel_store.remove(project.channel_id)
+    session_store.remove(project.channel_id)
+    pending_project_deletes.pop(project.channel_id, None)
+
+    try:
+        await project_channel.delete(reason=f"Delete Codex project {project.name}")
+    except discord.Forbidden:
+        await message.channel.send("프로젝트 폴더는 삭제했지만 Discord 채널 삭제 권한이 없어요.")
+    except discord.HTTPException as exc:
+        await message.channel.send(f"프로젝트 폴더는 삭제했지만 Discord 채널 삭제에 실패했어요: {exc}")
+
+
+async def handle_project_delete_message(message: discord.Message, prompt: str) -> bool:
+    if is_project_delete_confirmation(prompt):
+        pending = pending_delete_for_channel(message.channel)
+        if pending is not None or is_explicit_project_delete_confirmation(prompt):
+            await confirm_project_delete(message)
+            return True
+
+    if is_project_delete_request(prompt):
+        await request_project_delete(message)
+        return True
+
+    return False
+
+
 def instant_reply(message: discord.Message, prompt: str) -> str | None:
     if not settings.instant_replies_enabled or message.attachments:
         return None
@@ -1004,6 +1205,8 @@ async def on_message(message: discord.Message) -> None:
 
     if settings.mention_chat_enabled and bot.user and bot.user in message.mentions:
         prompt = strip_bot_mention(message.content)
+        if await handle_project_delete_message(message, prompt):
+            return
         project_name = extract_new_project_name(prompt)
         if project_name:
             await create_project_from_message(message, project_name)
@@ -1013,6 +1216,8 @@ async def on_message(message: discord.Message) -> None:
 
     wake_prompt = strip_wake_word(message.content)
     if wake_prompt is not None:
+        if await handle_project_delete_message(message, wake_prompt):
+            return
         project_name = extract_new_project_name(wake_prompt)
         if project_name:
             await create_project_from_message(message, project_name)
@@ -1021,6 +1226,8 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if settings.category_chat_enabled and is_in_codex_category(message.channel):
+        if await handle_project_delete_message(message, message.content):
+            return
         project_name = extract_new_project_name(message.content)
         if project_name:
             await create_project_from_message(message, project_name)
@@ -1029,6 +1236,8 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if settings.thread_chat_enabled and chat_channel_store.contains(message.channel.id):
+        if await handle_project_delete_message(message, message.content):
+            return
         await run_chat_turn(message, message.content)
 
 
@@ -1058,6 +1267,14 @@ async def codex_new(ctx: commands.Context, *, project_name: str = "") -> None:
         await ctx.reply(f"사용법: `{settings.prefix}codex-new <프로젝트 이름>`", mention_author=False)
         return
     await create_project_from_message(ctx.message, project_name)
+
+
+@bot.command(name="codex-delete", aliases=["codex-remove"])
+async def codex_delete(ctx: commands.Context, *, confirmation: str = "") -> None:
+    if confirmation.strip() and is_project_delete_confirmation(confirmation):
+        await confirm_project_delete(ctx.message)
+        return
+    await request_project_delete(ctx.message)
 
 
 @bot.command(name="codex-chat")
@@ -1227,6 +1444,7 @@ async def codex_help(ctx: commands.Context) -> None:
         [
             f"`{prefix}codex <요청>`: 새 Codex 작업 실행",
             f"`{prefix}codex-new <프로젝트 이름>`: 프로젝트 폴더와 Discord 채널 생성",
+            f"`{prefix}codex-delete`: 현재 프로젝트 채널과 로컬 프로젝트 폴더 삭제 요청",
             f"`{prefix}codex-continue <요청>`: 이 채널의 마지막 Codex 세션에 이어 요청",
             f"`{prefix}codex-resume <세션ID|메시지URL> <요청>`: 특정 세션 재개",
             f"`{prefix}codex-review [지시문]`: 현재 변경사항 리뷰",
