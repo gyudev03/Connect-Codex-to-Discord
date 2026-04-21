@@ -8,6 +8,7 @@ Discord 채널에서 로컬 `codex` CLI를 호출해 코딩 작업을 맡기는 
 1. Discord Developer Portal에서 봇을 만들고 토큰을 발급합니다.
 2. Bot 설정에서 **Privileged Gateway Intents** 아래의 **Message Content Intent**를 켭니다.
 3. 봇 초대 URL에는 최소 권한으로 `Read Messages/View Channels`, `Send Messages`, `Read Message History`, `Attach Files`를 넣습니다.
+   프로젝트 채널 자동 생성을 쓰려면 `Manage Channels`도 추가합니다.
 4. 이 PC에서 `codex login`이 완료되어 있어야 합니다.
 
 ## 설치
@@ -31,6 +32,7 @@ python bot.py
 ## 명령어
 
 - `!codex <요청>`: 새 Codex 작업을 실행합니다.
+- `!codex-new <프로젝트 이름>`: `CODEX_PROJECTS_ROOT` 아래에 프로젝트 폴더를 만들고 Codex 카테고리에 채널을 생성합니다.
 - `!codex-continue <요청>`: 이 채널에 저장된 마지막 Codex 세션을 이어갑니다.
 - `!codex-resume <세션ID|Discord 메시지 URL> <요청>`: 특정 세션을 이어갑니다.
 - `!codex-review [지시문]`: 현재 작업 트리의 변경사항을 리뷰합니다.
@@ -39,11 +41,20 @@ python bot.py
 
 이미지 첨부가 있는 `!codex`/`!codex-continue` 메시지는 첨부 이미지를 `codex exec --image`로 함께 전달합니다.
 
+Codex 카테고리의 일반 `#codex` 채널에서는 자연어로도 프로젝트를 만들 수 있습니다.
+
+```text
+코덱스야 새 프로젝트 Todo App 만들어줘
+```
+
+그러면 `D:\Coding\Todo App` 같은 폴더와 `#todo-app` 프로젝트 채널이 만들어지고, 이후 해당 채널의 Codex 작업은 그 폴더에서 실행됩니다.
+
 ## 설정
 
 `.env.example`의 주요 값:
 
 - `CODEX_WORKSPACE`: Codex가 실제로 수정할 저장소 경로
+- `CODEX_PROJECTS_ROOT`: 새 프로젝트 폴더를 만들 루트 경로
 - `CODEX_ARGS`: 기본값 `--full-auto`
 - `CODEX_MODEL`: 비워두면 Codex CLI 기본 모델 사용
 - `MAX_PARALLEL_CODEX_JOBS`: 동시에 실행할 Codex 작업 수

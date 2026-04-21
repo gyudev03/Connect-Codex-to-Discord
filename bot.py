@@ -154,6 +154,7 @@ class Settings:
     token: str
     prefix: str
     workspace: Path
+    projects_root: Path
     codex_command: str
     codex_model: str | None
     codex_args: list[str]
@@ -180,10 +181,12 @@ class Settings:
             raise RuntimeError("DISCORD_TOKEN is missing. Copy .env.example to .env and fill it in.")
 
         workspace = Path(os.environ.get("CODEX_WORKSPACE", os.getcwd())).expanduser().resolve()
+        projects_root = Path(os.environ.get("CODEX_PROJECTS_ROOT", r"D:\Coding")).expanduser().resolve()
         return cls(
             token=token,
             prefix=os.environ.get("COMMAND_PREFIX", "!").strip() or "!",
             workspace=workspace,
+            projects_root=projects_root,
             codex_command=os.environ.get("CODEX_COMMAND", "codex").strip() or "codex",
             codex_model=os.environ.get("CODEX_MODEL", "").strip() or None,
             codex_args=shlex.split(os.environ.get("CODEX_ARGS", "--full-auto")),
@@ -256,6 +259,69 @@ class ChatChannelStore:
         return str(channel_id) in self._channel_ids
 
 
+@dataclass
+class Project:
+    channel_id: int
+    name: str
+    slug: str
+    path: Path
+
+
+class ProjectStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._data: dict[str, dict[str, str]] = self._load()
+
+    def _load(self) -> dict[str, dict[str, str]]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in data.items()
+            if isinstance(value, dict) and "path" in value
+        }
+
+    def save(self) -> None:
+        self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def get(self, channel_id: int) -> Project | None:
+        data = self._data.get(str(channel_id))
+        if not data:
+            return None
+        return Project(
+            channel_id=channel_id,
+            name=data.get("name", ""),
+            slug=data.get("slug", ""),
+            path=Path(data["path"]).expanduser().resolve(),
+        )
+
+    def set(self, project: Project) -> None:
+        self._data[str(project.channel_id)] = {
+            "name": project.name,
+            "slug": project.slug,
+            "path": str(project.path),
+        }
+        self.save()
+
+    def find_by_slug(self, slug: str) -> Project | None:
+        for channel_id, data in self._data.items():
+            if data.get("slug") == slug:
+                return Project(
+                    channel_id=int(channel_id),
+                    name=data.get("name", ""),
+                    slug=data.get("slug", ""),
+                    path=Path(data["path"]).expanduser().resolve(),
+                )
+        return None
+
+
 class CodexBridge:
     def __init__(self, settings: Settings, session_store: SessionStore) -> None:
         self.settings = settings
@@ -293,7 +359,9 @@ class CodexBridge:
         *,
         resume_session_id: str | None = None,
         image_paths: Iterable[Path] = (),
+        workspace: Path | None = None,
     ) -> tuple[int, str, str | None]:
+        workspace = (workspace or self.settings.workspace).resolve()
         with tempfile.NamedTemporaryFile(prefix="codex-last-message-", suffix=".txt", delete=False) as output_file:
             output_path = Path(output_file.name)
 
@@ -304,14 +372,15 @@ class CodexBridge:
                 args.extend(["--image", str(image_path)])
             args.extend([resume_session_id, "-"])
         else:
-            args.extend(["exec", "-C", str(self.settings.workspace), "--json", "-o", str(output_path)])
+            args.extend(["exec", "-C", str(workspace), "--json", "-o", str(output_path)])
             for image_path in image_paths:
                 args.extend(["--image", str(image_path)])
             args.append("-")
 
-        return await self._run_process(channel_id, args, prompt, output_path=output_path)
+        return await self._run_process(channel_id, args, prompt, output_path=output_path, workspace=workspace)
 
-    async def run_review(self, channel_id: int, prompt: str) -> tuple[int, str, str | None]:
+    async def run_review(self, channel_id: int, prompt: str, *, workspace: Path | None = None) -> tuple[int, str, str | None]:
+        workspace = (workspace or self.settings.workspace).resolve()
         args = [self.settings.codex_command, "review", "--uncommitted"]
         if prompt:
             args.append("-")
@@ -319,7 +388,7 @@ class CodexBridge:
         else:
             stdin = ""
 
-        return_code, text, _ = await self._run_process(channel_id, args, stdin, output_path=None)
+        return_code, text, _ = await self._run_process(channel_id, args, stdin, output_path=None, workspace=workspace)
         return return_code, text, None
 
     async def _run_process(
@@ -329,13 +398,14 @@ class CodexBridge:
         stdin: str,
         *,
         output_path: Path | None,
+        workspace: Path,
     ) -> tuple[int, str, str | None]:
-        if not self.settings.workspace.exists():
+        if not workspace.exists():
             return (
                 1,
                 "Codex 작업 폴더를 찾지 못했어요.\n"
-                f"현재 CODEX_WORKSPACE: {self.settings.workspace}\n\n"
-                ".env의 CODEX_WORKSPACE를 실제로 존재하는 프로젝트 폴더로 바꿔 주세요.",
+                f"현재 작업 폴더: {workspace}\n\n"
+                "프로젝트 폴더가 존재하는지 확인해 주세요.",
                 None,
             )
 
@@ -346,7 +416,7 @@ class CodexBridge:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    cwd=str(self.settings.workspace),
+                    cwd=str(workspace),
                     creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
                 )
             except FileNotFoundError:
@@ -403,6 +473,7 @@ class CodexBridge:
 settings = Settings.from_env()
 session_store = SessionStore(Path("data") / "sessions.json")
 chat_channel_store = ChatChannelStore(Path("data") / "chat_channels.json")
+project_store = ProjectStore(Path("data") / "projects.json")
 bridge = CodexBridge(settings, session_store)
 
 intents = discord.Intents.default()
@@ -412,6 +483,29 @@ bot = commands.Bot(command_prefix=settings.prefix, intents=intents, help_command
 
 def normalize_discord_name(value: str) -> str:
     return value.strip().casefold()
+
+
+def slugify_project_name(name: str) -> str:
+    slug = name.strip().lower()
+    slug = re.sub(r"[\\/:*?\"<>|]", "", slug)
+    slug = re.sub(r"\s+", "-", slug)
+    slug = re.sub(r"[^0-9a-z가-힣_-]+", "-", slug)
+    slug = re.sub(r"-{2,}", "-", slug).strip("-_")
+    return slug[:80] or "project"
+
+
+def sanitize_project_folder_name(name: str) -> str:
+    cleaned = re.sub(r"[\\/:*?\"<>|]", "", name.strip())
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" .")
+    return cleaned or "New Project"
+
+
+def project_path_for_name(name: str) -> Path:
+    folder_name = sanitize_project_folder_name(name)
+    path = (settings.projects_root / folder_name).resolve()
+    if not path.is_relative_to(settings.projects_root):
+        raise ValueError("프로젝트 경로는 CODEX_PROJECTS_ROOT 안에 있어야 해요.")
+    return path
 
 
 def root_channel(channel: discord.abc.Messageable) -> discord.abc.Messageable:
@@ -466,6 +560,185 @@ def is_general_codex_channel(channel: discord.abc.Messageable) -> bool:
     return bool(channel_name) and normalize_discord_name(channel_name) in names
 
 
+def project_for_channel(channel: discord.abc.Messageable) -> Project | None:
+    root = root_channel(channel)
+    channel_id = getattr(root, "id", None)
+    if not isinstance(channel_id, int):
+        return None
+    return project_store.get(channel_id)
+
+
+def workspace_for_channel(channel: discord.abc.Messageable) -> Path:
+    project = project_for_channel(channel)
+    if project:
+        return project.path
+    return settings.workspace
+
+
+def extract_new_project_name(prompt: str) -> str | None:
+    text = prompt.strip()
+
+    if "프로젝트" not in text:
+        return None
+
+    create_words = ("만들어줘", "생성해줘", "만들자", "만들기", "생성", "만들어")
+    if not any(word in text for word in create_words):
+        return None
+
+    name_match = re.match(
+        r"^(.+?)(?:이라는|라는)?\s*이름으로\s*(?:새|새로운)?\s*프로젝트(?:를|을)?\s*(?:하나|1개)?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if name_match:
+        name = name_match.group(1).strip(" \"'“”‘’.。!！?？")
+        return name or None
+
+    name_first_match = re.match(
+        r"^(.+?)\s*프로젝트(?:를|을)?\s*(?:새로|새롭게|새|새로운)?\s*(?:하나|1개)?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)\s*$",
+        text,
+        re.IGNORECASE,
+    )
+    if name_first_match:
+        name = name_first_match.group(1).strip(" \"'“”‘’.。!！?？")
+        if name in {"새", "새로운", "새로", "하나", "1개"}:
+            return None
+        return name or None
+
+    patterns = [
+        r"^(?:새|새로운)\s*프로젝트(?:를|을)?\s*(?:하나|1개)?\s*[\"'“”‘’]?(.+?)[\"'“”‘’]?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)?$",
+        r"^프로젝트(?:를|을)?\s*(?:하나|1개)?\s*[\"'“”‘’]?(.+?)[\"'“”‘’]?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, text, re.IGNORECASE)
+        if match:
+            name = match.group(1).strip(" \"'“”‘’.。!！?？")
+            if name in {"하나", "1개", "만들어줘", "생성해줘", "만들자", "만들기", "생성", "만들어"}:
+                return None
+            return name or None
+    return None
+
+
+def find_codex_category(guild: discord.Guild, channel: discord.abc.Messageable) -> discord.CategoryChannel | None:
+    category = channel_category(channel)
+    if category and is_in_codex_category(channel):
+        return category
+    if settings.codex_category_id:
+        found = guild.get_channel(settings.codex_category_id)
+        if isinstance(found, discord.CategoryChannel):
+            return found
+    for candidate in guild.categories:
+        if normalize_discord_name(candidate.name) == normalize_discord_name(settings.codex_category_name):
+            return candidate
+    return None
+
+
+async def init_git_repo(path: Path) -> str | None:
+    if (path / ".git").exists():
+        return None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            "init",
+            cwd=str(path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return "git을 찾지 못해서 git init은 건너뛰었어요."
+
+    stdout, stderr = await process.communicate()
+    if process.returncode == 0:
+        return None
+    detail = (stderr or stdout).decode("utf-8", errors="replace").strip()
+    return f"git init에 실패했어요: {detail or process.returncode}"
+
+
+async def create_project_from_message(message: discord.Message, project_name: str) -> None:
+    if not await is_allowed_message(message):
+        return
+    if not is_general_codex_channel(message.channel):
+        await message.reply("새 프로젝트는 Codex 카테고리의 일반 `codex` 채널에서 만들어 주세요.", mention_author=False)
+        return
+    if not isinstance(message.channel, discord.TextChannel) or not message.guild:
+        await message.reply("서버 텍스트 채널에서만 프로젝트 채널을 만들 수 있어요.", mention_author=False)
+        return
+
+    category = find_codex_category(message.guild, message.channel)
+    if not category:
+        await message.reply("Codex 카테고리를 찾지 못했어요.", mention_author=False)
+        return
+
+    project_name = sanitize_project_folder_name(project_name)
+    slug = slugify_project_name(project_name)
+    existing_channel = discord.utils.get(category.text_channels, name=slug)
+    existing_project = project_store.find_by_slug(slug)
+    if existing_project:
+        await message.reply(
+            f"이미 연결된 프로젝트가 있어요.\n채널: <#{existing_project.channel_id}>\n경로: `{existing_project.path}`",
+            mention_author=False,
+        )
+        return
+
+    try:
+        project_path = project_path_for_name(project_name)
+    except ValueError as exc:
+        await message.reply(str(exc), mention_author=False)
+        return
+
+    member = message.guild.me
+    if existing_channel is None and member and not category.permissions_for(member).manage_channels:
+        await message.reply("채널을 만들 권한이 없어요. 봇에 Manage Channels 권한을 추가해 주세요.", mention_author=False)
+        return
+
+    try:
+        project_path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        await message.reply(f"프로젝트 폴더를 만들지 못했어요: `{project_path}`\n{exc}", mention_author=False)
+        return
+
+    git_warning = await init_git_repo(project_path)
+
+    if existing_channel:
+        project_channel = existing_channel
+    else:
+        try:
+            project_channel = await category.create_text_channel(
+                name=slug,
+                topic=f"Codex project: {project_name} | {project_path}",
+                reason=f"Create Codex project channel for {project_name}",
+            )
+        except discord.Forbidden:
+            await message.reply("채널을 만들 권한이 없어요. 봇에 Manage Channels 권한을 추가해 주세요.", mention_author=False)
+            return
+        except discord.HTTPException as exc:
+            await message.reply(f"Discord 채널 생성에 실패했어요: {exc}", mention_author=False)
+            return
+
+    project = Project(
+        channel_id=project_channel.id,
+        name=project_name,
+        slug=slug,
+        path=project_path,
+    )
+    project_store.set(project)
+    chat_channel_store.add(project_channel.id)
+
+    lines = [
+        f"`{project_name}` 프로젝트를 만들었어요.",
+        f"채널: {project_channel.mention}",
+        f"경로: `{project_path}`",
+    ]
+    if git_warning:
+        lines.append(git_warning)
+    await message.reply("\n".join(lines), mention_author=False)
+    await project_channel.send(
+        f"`{project_name}` 프로젝트 채널이에요.\n"
+        f"이 채널의 Codex 작업 폴더는 `{project_path}`입니다.\n"
+        "이제 여기서 바로 말하면 이 프로젝트 기준으로 작업합니다."
+    )
+
+
 def channel_context_prompt(message: discord.Message, prompt: str) -> str:
     if not is_in_codex_category(message.channel):
         return prompt
@@ -475,7 +748,16 @@ def channel_context_prompt(message: discord.Message, prompt: str) -> str:
     parent_channel = root_channel(message.channel)
     channel_name = getattr(parent_channel, "name", str(getattr(parent_channel, "id", "unknown")))
 
-    if is_general_codex_channel(message.channel):
+    project = project_for_channel(message.channel)
+
+    if project:
+        context = (
+            f"Discord context: This message is from project channel #{channel_name} "
+            f"in the {category_name} category. This channel is linked to local project "
+            f"{project.name} at {project.path}. Keep project-specific context, decisions, "
+            "and follow-up work scoped to this project."
+        )
+    elif is_general_codex_channel(message.channel):
         context = (
             f"Discord context: This message is from #{channel_name} in the {category_name} category. "
             "Treat it as the general Codex channel where the user may ask about anything."
@@ -522,9 +804,10 @@ def instant_reply(message: discord.Message, prompt: str) -> str | None:
     if normalized in {"상태", "상태확인", "status"}:
         active = message.channel.id in bridge.active_processes
         session_id = session_store.get(message.channel.id)
+        workspace = workspace_for_channel(message.channel)
         return "\n".join(
             [
-                f"작업 폴더: `{settings.workspace}`",
+                f"작업 폴더: `{workspace}`",
                 f"실행 중: `{'yes' if active else 'no'}`",
                 f"저장된 세션: `{session_id or 'none'}`",
             ]
@@ -650,6 +933,7 @@ async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_sess
     session_id = None if force_new_session else session_store.get(message.channel.id)
     image_paths = await bridge.save_attachments(message)
     codex_prompt = channel_context_prompt(message, prompt)
+    workspace = workspace_for_channel(message.channel)
 
     async with message.channel.typing():
         if session_id:
@@ -660,6 +944,7 @@ async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_sess
                     codex_prompt,
                     resume_session_id=session_id,
                     image_paths=image_paths,
+                    workspace=workspace,
                 ),
             )
             await send_codex_result(message, "Codex", return_code, output, new_session_id or session_id)
@@ -670,6 +955,7 @@ async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_sess
                     message.channel.id,
                     codex_prompt,
                     image_paths=image_paths,
+                    workspace=workspace,
                 ),
             )
             await send_codex_result(message, "Codex", return_code, output, new_session_id)
@@ -717,15 +1003,28 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if settings.mention_chat_enabled and bot.user and bot.user in message.mentions:
-        await run_chat_turn(message, strip_bot_mention(message.content))
+        prompt = strip_bot_mention(message.content)
+        project_name = extract_new_project_name(prompt)
+        if project_name:
+            await create_project_from_message(message, project_name)
+            return
+        await run_chat_turn(message, prompt)
         return
 
     wake_prompt = strip_wake_word(message.content)
     if wake_prompt is not None:
+        project_name = extract_new_project_name(wake_prompt)
+        if project_name:
+            await create_project_from_message(message, project_name)
+            return
         await run_chat_turn(message, wake_prompt)
         return
 
     if settings.category_chat_enabled and is_in_codex_category(message.channel):
+        project_name = extract_new_project_name(message.content)
+        if project_name:
+            await create_project_from_message(message, project_name)
+            return
         await run_chat_turn(message, message.content)
         return
 
@@ -743,12 +1042,22 @@ async def codex_command(ctx: commands.Context, *, prompt: str = "") -> None:
 
     image_paths = await bridge.save_attachments(ctx.message)
     codex_prompt = channel_context_prompt(ctx.message, prompt)
+    workspace = workspace_for_channel(ctx.channel)
     async with ctx.channel.typing():
         return_code, output, session_id = await run_with_slow_notice(
             ctx.message,
-            bridge.run_exec(ctx.channel.id, codex_prompt, image_paths=image_paths),
+            bridge.run_exec(ctx.channel.id, codex_prompt, image_paths=image_paths, workspace=workspace),
         )
     await send_codex_result(ctx, "Codex 작업", return_code, output, session_id)
+
+
+@bot.command(name="codex-new", aliases=["codex-project"])
+async def codex_new(ctx: commands.Context, *, project_name: str = "") -> None:
+    project_name = project_name.strip()
+    if not project_name:
+        await ctx.reply(f"사용법: `{settings.prefix}codex-new <프로젝트 이름>`", mention_author=False)
+        return
+    await create_project_from_message(ctx.message, project_name)
 
 
 @bot.command(name="codex-chat")
@@ -784,10 +1093,11 @@ async def codex_chat(ctx: commands.Context, *, prompt: str = "") -> None:
     if prompt.strip():
         image_paths = await bridge.save_attachments(ctx.message)
         codex_prompt = channel_context_prompt(ctx.message, prompt)
+        workspace = workspace_for_channel(thread)
         async with thread.typing():
             return_code, output, session_id = await run_with_slow_notice(
                 thread,
-                bridge.run_exec(thread.id, codex_prompt, image_paths=image_paths),
+                bridge.run_exec(thread.id, codex_prompt, image_paths=image_paths, workspace=workspace),
             )
         await send_codex_result_to_channel(thread, "Codex", return_code, output, session_id)
 
@@ -815,6 +1125,7 @@ async def codex_continue(ctx: commands.Context, *, prompt: str = "") -> None:
 
     image_paths = await bridge.save_attachments(ctx.message)
     codex_prompt = channel_context_prompt(ctx.message, prompt)
+    workspace = workspace_for_channel(ctx.channel)
     async with ctx.channel.typing():
         return_code, output, new_session_id = await run_with_slow_notice(
             ctx.message,
@@ -823,6 +1134,7 @@ async def codex_continue(ctx: commands.Context, *, prompt: str = "") -> None:
                 codex_prompt,
                 resume_session_id=session_id,
                 image_paths=image_paths,
+                workspace=workspace,
             ),
         )
     await send_codex_result(ctx, "Codex 이어하기", return_code, output, new_session_id or session_id)
@@ -844,6 +1156,7 @@ async def codex_resume(ctx: commands.Context, session_id_or_url: str = "", *, pr
 
     image_paths = await bridge.save_attachments(ctx.message)
     codex_prompt = channel_context_prompt(ctx.message, prompt)
+    workspace = workspace_for_channel(ctx.channel)
     async with ctx.channel.typing():
         return_code, output, new_session_id = await run_with_slow_notice(
             ctx.message,
@@ -852,6 +1165,7 @@ async def codex_resume(ctx: commands.Context, session_id_or_url: str = "", *, pr
                 codex_prompt,
                 resume_session_id=session_id,
                 image_paths=image_paths,
+                workspace=workspace,
             ),
         )
     await send_codex_result(ctx, "Codex 세션 재개", return_code, output, new_session_id or session_id)
@@ -865,7 +1179,7 @@ async def codex_review(ctx: commands.Context, *, prompt: str = "") -> None:
     async with ctx.channel.typing():
         return_code, output, _ = await run_with_slow_notice(
             ctx.message,
-            bridge.run_review(ctx.channel.id, prompt.strip()),
+            bridge.run_review(ctx.channel.id, prompt.strip(), workspace=workspace_for_channel(ctx.channel)),
         )
     await send_codex_result(ctx, "Codex 리뷰", return_code, output, None)
 
@@ -886,14 +1200,18 @@ async def codex_status(ctx: commands.Context) -> None:
     active = ctx.channel.id in bridge.active_processes
     session_id = session_store.get(ctx.channel.id)
     category = channel_category(ctx.channel)
+    workspace = workspace_for_channel(ctx.channel)
+    project = project_for_channel(ctx.channel)
     if is_in_codex_category(ctx.channel) and is_general_codex_channel(ctx.channel):
         channel_mode = "general"
+    elif project:
+        channel_mode = f"project:{project.name}"
     elif is_in_codex_category(ctx.channel):
         channel_mode = "project"
     else:
         channel_mode = "outside-codex-category"
     lines = [
-        f"작업 폴더: `{settings.workspace}`",
+        f"작업 폴더: `{workspace}`",
         f"Codex 카테고리: `{category.name if category else 'none'}`",
         f"채널 모드: `{channel_mode}`",
         f"실행 중: `{'yes' if active else 'no'}`",
@@ -908,6 +1226,7 @@ async def codex_help(ctx: commands.Context) -> None:
     text = "\n".join(
         [
             f"`{prefix}codex <요청>`: 새 Codex 작업 실행",
+            f"`{prefix}codex-new <프로젝트 이름>`: 프로젝트 폴더와 Discord 채널 생성",
             f"`{prefix}codex-continue <요청>`: 이 채널의 마지막 Codex 세션에 이어 요청",
             f"`{prefix}codex-resume <세션ID|메시지URL> <요청>`: 특정 세션 재개",
             f"`{prefix}codex-review [지시문]`: 현재 변경사항 리뷰",
@@ -923,6 +1242,7 @@ async def codex_help(ctx: commands.Context) -> None:
         ]
     )
     text += "\n`코덱스야 요청`: 멘션 없이 Codex에게 요청"
+    text += "\n`코덱스야 새 프로젝트 Todo App 만들어줘`: 프로젝트 채널과 로컬 폴더 생성"
     text += "\n\nCodex 카테고리 안에서는 명령어 없이 바로 대화할 수 있어요."
     text += "\n`#codex`: 일반 질문 채널"
     text += "\n그 외 Codex 카테고리 채널: 채널별 프로젝트"
