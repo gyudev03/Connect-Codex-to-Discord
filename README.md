@@ -32,7 +32,8 @@ python bot.py
 ## 명령어
 
 - `!codex <요청>`: 새 Codex 작업을 실행합니다.
-- `!codex-new <프로젝트 이름>`: `CODEX_PROJECTS_ROOT` 아래에 프로젝트 폴더를 만들고 Codex 카테고리에 채널을 생성합니다.
+- `!codex-new <프로젝트 이름>`: `CODEX_PROJECTS_ROOT` 아래에 프로젝트 폴더를 만들고 ai 카테고리에 채널을 생성합니다.
+- `!codex-new <프로젝트 이름> --github --private`: 프로젝트를 만든 뒤 GitHub 저장소 생성 확인 메시지를 보냅니다.
 - `!codex-commit <메시지>`: 확인 이모지를 누른 뒤 현재 채널의 작업 폴더를 커밋합니다.
 - `!codex-push <메시지>`: 확인 이모지를 누른 뒤 현재 채널의 작업 폴더를 커밋하고 푸시합니다.
 - `!codex-continue <요청>`: 이 채널에 저장된 마지막 Codex 세션을 이어갑니다.
@@ -43,15 +44,18 @@ python bot.py
 
 이미지 첨부가 있는 `!codex`/`!codex-continue` 메시지는 첨부 이미지를 `codex exec --image`로 함께 전달합니다.
 
-Codex 카테고리의 일반 `#codex` 채널에서는 자연어로도 프로젝트를 만들 수 있습니다.
+ai 카테고리의 일반 `#ai` 채널에서는 자연어로도 프로젝트를 만들 수 있습니다.
 
 ```text
 코덱스야 새 프로젝트 Todo App 만들어줘
+코덱스야 Todo App 프로젝트 만들고 GitHub에도 private로 만들어줘
 ```
 
 그러면 `D:\Coding\Todo App` 같은 폴더와 `#todo-app` 프로젝트 채널이 만들어지고, 이후 해당 채널의 Codex 작업은 그 폴더에서 실행됩니다.
 
-커밋/푸시는 바로 실행되지 않고 봇이 확인 메시지에 `✅` 이모지를 달아 둡니다. 요청한 사용자가 그 이모지를 누르면 실행됩니다.
+GitHub 저장소 생성은 GitHub CLI(`gh`)를 사용합니다. PC에서 먼저 `gh auth login`을 완료해 두세요. 저장소 생성은 바로 실행되지 않고 봇이 확인 메시지에 `✅`/`❌` 이모지를 달아 둡니다.
+
+커밋/푸시도 바로 실행되지 않고 봇이 확인 메시지에 `✅`/`❌` 이모지를 달아 둡니다. 요청한 사용자가 `✅`를 누르면 실행되고, `❌`를 누르면 취소됩니다.
 
 ```text
 코덱스야 커밋해줘
@@ -69,6 +73,9 @@ Codex 카테고리의 일반 `#codex` 채널에서는 자연어로도 프로젝�
 - `MAX_PARALLEL_CODEX_JOBS`: 동시에 실행할 Codex 작업 수
 - `DISCORD_ALLOWED_CHANNEL_IDS`: 특정 채널에서만 허용하고 싶을 때 사용
 - `DISCORD_ALLOWED_ROLE_IDS`: 특정 역할만 허용하고 싶을 때 사용
+- `GITHUB_REPO_OWNER`: 비워두면 `gh`에 로그인된 계정에 저장소를 만들고, 값이 있으면 `owner/repo` 형태로 만듭니다.
+- `GITHUB_DEFAULT_VISIBILITY`: GitHub 저장소 기본 공개 범위. `private`, `public`, `internal` 중 하나
+- `INSTANT_REPLIES_ENABLED`: 기본값 `false`. `false`이면 인사/도움말/상태 같은 짧은 메시지도 하드코딩 즉답 대신 Codex AI로 전달합니다.
 
 ## 안전 메모
 

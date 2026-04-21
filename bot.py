@@ -153,6 +153,15 @@ def parse_discord_id_from_url(url: str) -> int | None:
     return None
 
 
+def github_visibility(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in {"public", "공개"}:
+        return "public"
+    if normalized in {"internal", "내부"}:
+        return "internal"
+    return "private"
+
+
 @dataclass
 class Settings:
     token: str
@@ -178,6 +187,8 @@ class Settings:
     instant_replies_enabled: bool
     slow_notice_enabled: bool
     slow_notice_seconds: int
+    github_repo_owner: str | None
+    github_default_visibility: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -201,17 +212,19 @@ class Settings:
             allowed_channel_ids=env_list("DISCORD_ALLOWED_CHANNEL_IDS"),
             allowed_role_ids=env_list("DISCORD_ALLOWED_ROLE_IDS"),
             codex_category_id=env_optional_int("DISCORD_CODEX_CATEGORY_ID"),
-            codex_category_name=os.environ.get("DISCORD_CODEX_CATEGORY_NAME", "Codex").strip(),
+            codex_category_name=os.environ.get("DISCORD_CODEX_CATEGORY_NAME", "ai").strip(),
             changelog_forum_id=env_optional_int("DISCORD_CHANGELOG_FORUM_ID"),
-            changelog_forum_name=os.environ.get("DISCORD_CHANGELOG_FORUM_NAME", "codex-수정내역").strip(),
-            general_channel_names=env_text_list("CODEX_GENERAL_CHANNEL_NAMES", "codex"),
+            changelog_forum_name=os.environ.get("DISCORD_CHANGELOG_FORUM_NAME", "ai-수정내역").strip(),
+            general_channel_names=env_text_list("CODEX_GENERAL_CHANNEL_NAMES", "ai"),
             category_chat_enabled=env_bool("CATEGORY_CHAT_ENABLED", True),
             mention_chat_enabled=env_bool("MENTION_CHAT_ENABLED", True),
             thread_chat_enabled=env_bool("THREAD_CHAT_ENABLED", True),
             wake_words=env_text_list("WAKE_WORDS", "코덱스야,코덱스"),
-            instant_replies_enabled=env_bool("INSTANT_REPLIES_ENABLED", True),
+            instant_replies_enabled=env_bool("INSTANT_REPLIES_ENABLED", False),
             slow_notice_enabled=env_bool("SLOW_NOTICE_ENABLED", True),
             slow_notice_seconds=max(1, env_int("SLOW_NOTICE_SECONDS", 12)),
+            github_repo_owner=os.environ.get("GITHUB_REPO_OWNER", "").strip() or None,
+            github_default_visibility=github_visibility(os.environ.get("GITHUB_DEFAULT_VISIBILITY", "private")),
         )
 
 
@@ -324,6 +337,20 @@ class PendingGitAction:
     workspace: Path
     requested_by_id: int
     commit_message: str
+    created_at: float
+
+
+@dataclass
+class GithubRepoOptions:
+    visibility: str
+
+
+@dataclass
+class PendingGithubRepoAction:
+    project: Project
+    repo_name: str
+    visibility: str
+    requested_by_id: int
     created_at: float
 
 
@@ -541,6 +568,7 @@ changelog_thread_store = ChangelogThreadStore(Path("data") / "changelog_threads.
 project_store = ProjectStore(Path("data") / "projects.json")
 pending_project_deletes: dict[int, PendingProjectDelete] = {}
 pending_git_actions: dict[int, PendingGitAction] = {}
+pending_github_repo_actions: dict[int, PendingGithubRepoAction] = {}
 GIT_CONFIRM_EMOJI = "✅"
 GIT_CANCEL_EMOJI = "❌"
 DEFAULT_COMMIT_MESSAGE = "update from Discord Codex"
@@ -646,18 +674,68 @@ def workspace_for_channel(channel: discord.abc.Messageable) -> Path:
     return settings.workspace
 
 
+def github_repo_options_from_prompt(prompt: str) -> GithubRepoOptions | None:
+    text = prompt.casefold()
+    if not any(word in text for word in ("github", "깃허브", "깃헙")) and "--github" not in text:
+        return None
+
+    if "--public" in text or "public" in text or ("공개" in prompt and "비공개" not in prompt):
+        visibility = "public"
+    elif "--internal" in text or "internal" in text:
+        visibility = "internal"
+    elif "--private" in text or "private" in text or "비공개" in prompt or "프라이빗" in prompt:
+        visibility = "private"
+    else:
+        visibility = settings.github_default_visibility
+
+    return GithubRepoOptions(visibility=visibility)
+
+
+def strip_github_project_options(prompt: str) -> str:
+    text = prompt
+    text = re.sub(r"--(?:github|private|public|internal)\b", " ", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"(?:github|깃허브|깃헙)(?:에도|에도요|도|에)?\s*"
+        r"(?:(?:private|public|internal|비공개|공개|프라이빗)(?:로|으로)?\s*)?"
+        r"(?:(?:저장소|repo|repository)(?:를|을|도)?\s*)?"
+        r"(?:(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들기|생성|만들어)\s*)?",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def project_command_parts(raw_project_name: str) -> tuple[str, GithubRepoOptions | None]:
+    github_options = github_repo_options_from_prompt(raw_project_name)
+    project_name = strip_github_project_options(raw_project_name) if github_options else raw_project_name
+    return project_name.strip(), github_options
+
+
+async def handle_project_create_message(message: discord.Message, prompt: str) -> bool:
+    github_options = github_repo_options_from_prompt(prompt)
+    project_prompt = strip_github_project_options(prompt) if github_options else prompt
+    project_name = extract_new_project_name(project_prompt)
+    if not project_name:
+        return False
+
+    await create_project_from_message(message, project_name, github_options=github_options)
+    return True
+
+
 def extract_new_project_name(prompt: str) -> str | None:
     text = prompt.strip()
 
     if "프로젝트" not in text:
         return None
 
-    create_words = ("만들어줘", "생성해줘", "만들자", "만들기", "생성", "만들어")
+    create_words = ("만들어줘", "생성해줘", "만들자", "만들기", "생성", "만들어", "만들고", "생성하고")
     if not any(word in text for word in create_words):
         return None
 
     name_match = re.match(
-        r"^(.+?)(?:이라는|라는)?\s*이름으로\s*(?:새|새로운)?\s*프로젝트(?:를|을)?\s*(?:하나|1개)?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)\s*$",
+        r"^(.+?)(?:이라는|라는)?\s*이름으로\s*(?:새|새로운)?\s*프로젝트(?:를|을)?\s*(?:하나|1개)?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어|만들고|생성하고)\s*$",
         text,
         re.IGNORECASE,
     )
@@ -666,7 +744,7 @@ def extract_new_project_name(prompt: str) -> str | None:
         return name or None
 
     name_first_match = re.match(
-        r"^(.+?)\s*프로젝트(?:를|을)?\s*(?:새로|새롭게|새|새로운)?\s*(?:하나|1개)?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)\s*$",
+        r"^(.+?)\s*프로젝트(?:를|을)?\s*(?:새로|새롭게|새|새로운)?\s*(?:하나|1개)?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어|만들고|생성하고)\s*$",
         text,
         re.IGNORECASE,
     )
@@ -677,14 +755,14 @@ def extract_new_project_name(prompt: str) -> str | None:
         return name or None
 
     patterns = [
-        r"^(?:새|새로운)\s*프로젝트(?:를|을)?\s*(?:하나|1개)?\s*[\"'“”‘’]?(.+?)[\"'“”‘’]?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)?$",
-        r"^프로젝트(?:를|을)?\s*(?:하나|1개)?\s*[\"'“”‘’]?(.+?)[\"'“”‘’]?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어)$",
+        r"^(?:새|새로운)\s*프로젝트(?:를|을)?\s*(?:하나|1개)?\s*[\"'“”‘’]?(.+?)[\"'“”‘’]?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어|만들고|생성하고)?$",
+        r"^프로젝트(?:를|을)?\s*(?:하나|1개)?\s*[\"'“”‘’]?(.+?)[\"'“”‘’]?\s*(?:만들어\s*줘|만들어줘|생성해\s*줘|생성해줘|만들자|만들기|생성|만들어|만들고|생성하고)$",
     ]
     for pattern in patterns:
         match = re.match(pattern, text, re.IGNORECASE)
         if match:
             name = match.group(1).strip(" \"'“”‘’.。!！?？")
-            if name in {"하나", "1개", "만들어줘", "생성해줘", "만들자", "만들기", "생성", "만들어"}:
+            if name in {"하나", "1개", "만들어줘", "생성해줘", "만들자", "만들기", "생성", "만들어", "만들고", "생성하고"}:
                 return None
             return name or None
     return None
@@ -781,7 +859,7 @@ async def get_or_create_changelog_thread(
             name=project_name[:100],
             content=initial_content,
             allowed_mentions=discord.AllowedMentions.none(),
-            reason=f"Create Codex changelog post for {project_name}",
+            reason=f"Create AI changelog post for {project_name}",
         )
     except (discord.Forbidden, discord.HTTPException):
         return None
@@ -811,11 +889,15 @@ async def init_git_repo(path: Path) -> str | None:
     return f"git init에 실패했어요: {detail or process.returncode}"
 
 
-async def create_project_from_message(message: discord.Message, project_name: str) -> None:
+async def create_project_from_message(
+    message: discord.Message,
+    project_name: str,
+    github_options: GithubRepoOptions | None = None,
+) -> None:
     if not await is_allowed_message(message):
         return
     if not is_general_codex_channel(message.channel):
-        await message.reply("새 프로젝트는 Codex 카테고리의 일반 `codex` 채널에서 만들어 주세요.", mention_author=False)
+        await message.reply("새 프로젝트는 ai 카테고리의 일반 `ai` 채널에서 만들어 주세요.", mention_author=False)
         return
     if not isinstance(message.channel, discord.TextChannel) or not message.guild:
         await message.reply("서버 텍스트 채널에서만 프로젝트 채널을 만들 수 있어요.", mention_author=False)
@@ -823,7 +905,7 @@ async def create_project_from_message(message: discord.Message, project_name: st
 
     category = find_codex_category(message.guild, message.channel)
     if not category:
-        await message.reply("Codex 카테고리를 찾지 못했어요.", mention_author=False)
+        await message.reply("ai 카테고리를 찾지 못했어요.", mention_author=False)
         return
 
     project_name = sanitize_project_folder_name(project_name)
@@ -862,8 +944,8 @@ async def create_project_from_message(message: discord.Message, project_name: st
         try:
             project_channel = await category.create_text_channel(
                 name=slug,
-                topic=f"Codex project: {project_name} | {project_path}",
-                reason=f"Create Codex project channel for {project_name}",
+                topic=f"AI project: {project_name} | {project_path}",
+                reason=f"Create AI project channel for {project_name}",
             )
         except discord.Forbidden:
             await message.reply("채널을 만들 권한이 없어요. 봇에 Manage Channels 권한을 추가해 주세요.", mention_author=False)
@@ -888,12 +970,16 @@ async def create_project_from_message(message: discord.Message, project_name: st
     ]
     if git_warning:
         lines.append(git_warning)
+    if github_options:
+        lines.append("GitHub 저장소 생성은 아래 확인 메시지에서 선택해 주세요.")
     await message.reply("\n".join(lines), mention_author=False)
     await project_channel.send(
         f"`{project_name}` 프로젝트 채널이에요.\n"
         f"이 채널의 Codex 작업 폴더는 `{project_path}`입니다.\n"
         "이제 여기서 바로 말하면 이 프로젝트 기준으로 작업합니다."
     )
+    if github_options:
+        await request_github_repo_creation(message, project, github_options.visibility)
 
 
 def channel_context_prompt(message: discord.Message, prompt: str) -> str:
@@ -917,7 +1003,7 @@ def channel_context_prompt(message: discord.Message, prompt: str) -> str:
     elif is_general_codex_channel(message.channel):
         context = (
             f"Discord context: This message is from #{channel_name} in the {category_name} category. "
-            "Treat it as the general Codex channel where the user may ask about anything. "
+            "Treat it as the general AI channel where the user may ask about anything. "
             f"Do not include long examples, stderr/stdout dumps, or detailed change logs in #{channel_name}; "
             f"project-specific change details belong in the {settings.changelog_forum_name} forum post named after the project."
         )
@@ -1133,7 +1219,7 @@ async def confirm_project_delete(message: discord.Message) -> None:
     pending_project_deletes.pop(project.channel_id, None)
 
     try:
-        await project_channel.delete(reason=f"Delete Codex project {project.name}")
+        await project_channel.delete(reason=f"Delete AI project {project.name}")
     except discord.Forbidden:
         await message.channel.send("프로젝트 폴더는 삭제했지만 Discord 채널 삭제 권한이 없어요.")
     except discord.HTTPException as exc:
@@ -1169,6 +1255,7 @@ def instant_reply(message: discord.Message, prompt: str) -> str | None:
                 "이렇게 말하면 돼요.",
                 f"`코덱스야 <요청>`: 바로 대화하기",
                 f"`{prefix}codex <요청>`: 새 작업 맡기기",
+                f"`{prefix}codex-new Todo --github --private`: 프로젝트와 GitHub 저장소 만들기",
                 f"`{prefix}codex-chat <요청>`: 대화용 스레드 열기",
                 f"`{prefix}codex-status`: 현재 상태 보기",
             ]
@@ -1200,7 +1287,7 @@ def author_has_allowed_role(author: discord.abc.User) -> bool:
 
 async def is_allowed_message(message: discord.Message) -> bool:
     if not is_in_codex_category(message.channel):
-        await message.reply("Codex 카테고리 안의 채널에서만 사용할 수 있어요.", mention_author=False)
+        await message.reply("ai 카테고리 안의 채널에서만 사용할 수 있어요.", mention_author=False)
         return False
 
     if settings.allowed_channel_ids and not channel_acl_ids(message.channel).intersection(settings.allowed_channel_ids):
@@ -1279,6 +1366,88 @@ async def git_current_branch(workspace: Path) -> str:
     if code == 0 and stdout:
         return stdout
     return "unknown"
+
+
+async def run_gh(workspace: Path, *args: str) -> tuple[int, str, str]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "gh",
+            *args,
+            cwd=str(workspace),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return 127, "", "GitHub CLI(gh)를 찾지 못했어요. 먼저 `gh auth login`까지 완료해 주세요."
+    except OSError as exc:
+        return 1, "", str(exc)
+
+    stdout, stderr = await process.communicate()
+    return (
+        process.returncode or 0,
+        stdout.decode("utf-8", errors="replace").strip(),
+        stderr.decode("utf-8", errors="replace").strip(),
+    )
+
+
+def github_repo_name_for_project(project: Project) -> str:
+    if settings.github_repo_owner:
+        return f"{settings.github_repo_owner}/{project.slug}"
+    return project.slug
+
+
+async def request_github_repo_creation(
+    message: discord.Message,
+    project: Project,
+    visibility: str,
+) -> None:
+    if not await is_allowed_message(message):
+        return
+
+    visibility = github_visibility(visibility)
+    if not project.path.exists():
+        await message.reply(f"프로젝트 폴더를 찾지 못했어요: `{project.path}`", mention_author=False)
+        return
+
+    if not await is_git_repo(project.path):
+        await message.reply(f"GitHub 저장소를 만들려면 먼저 Git 저장소여야 해요: `{project.path}`", mention_author=False)
+        return
+
+    remote_code, remote_stdout, _ = await run_git(project.path, "remote", "get-url", "origin")
+    if remote_code == 0 and remote_stdout:
+        await message.reply(f"이미 origin remote가 연결되어 있어요.\n`{remote_stdout}`", mention_author=False)
+        return
+
+    repo_name = github_repo_name_for_project(project)
+    visibility_label = {"private": "비공개", "public": "공개", "internal": "내부"}.get(visibility, visibility)
+    confirm_message = await message.reply(
+        "\n".join(
+            [
+                "GitHub 저장소도 만들까요?",
+                f"프로젝트: `{project.name}`",
+                f"로컬 경로: `{project.path}`",
+                f"저장소: `{repo_name}`",
+                f"공개 범위: `{visibility_label}`",
+                "",
+                f"{GIT_CONFIRM_EMOJI} 반응을 누르면 생성하고, {GIT_CANCEL_EMOJI} 반응을 누르면 취소합니다.",
+            ]
+        ),
+        mention_author=False,
+    )
+    try:
+        await confirm_message.add_reaction(GIT_CONFIRM_EMOJI)
+        await confirm_message.add_reaction(GIT_CANCEL_EMOJI)
+    except discord.HTTPException:
+        await confirm_message.reply("확인 이모지를 달지 못했어요. 봇의 반응 추가 권한을 확인해 주세요.", mention_author=False)
+        return
+
+    pending_github_repo_actions[confirm_message.id] = PendingGithubRepoAction(
+        project=project,
+        repo_name=repo_name,
+        visibility=visibility,
+        requested_by_id=message.author.id,
+        created_at=time.time(),
+    )
 
 
 def truncate_lines(text: str, max_lines: int = 12) -> str:
@@ -1436,6 +1605,71 @@ async def cancel_pending_git_action(reaction: discord.Reaction, user: discord.ab
         return
 
     await reaction.message.reply("커밋/푸시 요청을 취소했어요.", mention_author=False)
+
+
+async def execute_pending_github_repo_action(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    pending = pending_github_repo_actions.pop(reaction.message.id, None)
+    if not pending:
+        return
+    if user.id != pending.requested_by_id:
+        pending_github_repo_actions[reaction.message.id] = pending
+        return
+    if time.time() - pending.created_at > 600:
+        await reaction.message.reply("확인 시간이 지나서 GitHub 저장소 생성 요청을 취소했어요. 다시 요청해 주세요.", mention_author=False)
+        return
+
+    project = pending.project
+    async with reaction.message.channel.typing():
+        remote_code, remote_stdout, _ = await run_git(project.path, "remote", "get-url", "origin")
+        if remote_code == 0 and remote_stdout:
+            await reaction.message.reply(f"이미 origin remote가 연결되어 있어요.\n`{remote_stdout}`", mention_author=False)
+            return
+
+        code, stdout, stderr = await run_gh(
+            project.path,
+            "repo",
+            "create",
+            pending.repo_name,
+            f"--{pending.visibility}",
+            "--source",
+            str(project.path),
+            "--remote",
+            "origin",
+        )
+
+    detail = stdout or stderr
+    if code == 0:
+        lines = [
+            "GitHub 저장소를 만들고 origin remote를 연결했어요.",
+            f"저장소: `{pending.repo_name}`",
+        ]
+        if detail:
+            lines.extend(["", f"```text\n{detail}\n```"])
+        await reaction.message.reply("\n".join(lines), mention_author=False)
+        return
+
+    await reaction.message.reply(
+        "\n".join(
+            [
+                "GitHub 저장소 생성에 실패했어요.",
+                "PC에서 `gh auth login`을 완료했는지 확인해 주세요.",
+                "",
+                f"```text\n{detail or code}\n```",
+            ]
+        ),
+        mention_author=False,
+    )
+
+
+async def cancel_pending_github_repo_action(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    pending = pending_github_repo_actions.pop(reaction.message.id, None)
+    if not pending:
+        return
+    if user.id != pending.requested_by_id:
+        pending_github_repo_actions[reaction.message.id] = pending
+        return
+
+    await reaction.message.reply("GitHub 저장소 생성 요청을 취소했어요.", mention_author=False)
 
 
 def changelog_project_name(channel: discord.abc.Messageable) -> str:
@@ -1732,8 +1966,10 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.abc.User) ->
     emoji = str(reaction.emoji)
     if emoji == GIT_CONFIRM_EMOJI:
         await execute_pending_git_action(reaction, user)
+        await execute_pending_github_repo_action(reaction, user)
     elif emoji == GIT_CANCEL_EMOJI:
         await cancel_pending_git_action(reaction, user)
+        await cancel_pending_github_repo_action(reaction, user)
 
 
 @bot.event
@@ -1754,9 +1990,7 @@ async def on_message(message: discord.Message) -> None:
             return
         if await handle_project_delete_message(message, prompt):
             return
-        project_name = extract_new_project_name(prompt)
-        if project_name:
-            await create_project_from_message(message, project_name)
+        if await handle_project_create_message(message, prompt):
             return
         await run_chat_turn(message, prompt)
         return
@@ -1769,9 +2003,7 @@ async def on_message(message: discord.Message) -> None:
             return
         if await handle_project_delete_message(message, wake_prompt):
             return
-        project_name = extract_new_project_name(wake_prompt)
-        if project_name:
-            await create_project_from_message(message, project_name)
+        if await handle_project_create_message(message, wake_prompt):
             return
         await run_chat_turn(message, wake_prompt)
         return
@@ -1783,9 +2015,7 @@ async def on_message(message: discord.Message) -> None:
             return
         if await handle_project_delete_message(message, message.content):
             return
-        project_name = extract_new_project_name(message.content)
-        if project_name:
-            await create_project_from_message(message, project_name)
+        if await handle_project_create_message(message, message.content):
             return
         await run_chat_turn(message, message.content)
         return
@@ -1817,11 +2047,11 @@ async def codex_command(ctx: commands.Context, *, prompt: str = "") -> None:
 
 @bot.command(name="codex-new", aliases=["codex-project"])
 async def codex_new(ctx: commands.Context, *, project_name: str = "") -> None:
-    project_name = project_name.strip()
+    project_name, github_options = project_command_parts(project_name)
     if not project_name:
-        await ctx.reply(f"사용법: `{settings.prefix}codex-new <프로젝트 이름>`", mention_author=False)
+        await ctx.reply(f"사용법: `{settings.prefix}codex-new <프로젝트 이름> [--github] [--private|--public]`", mention_author=False)
         return
-    await create_project_from_message(ctx.message, project_name)
+    await create_project_from_message(ctx.message, project_name, github_options=github_options)
 
 
 @bot.command(name="codex-delete", aliases=["codex-remove"])
@@ -1856,9 +2086,9 @@ async def codex_chat(ctx: commands.Context, *, prompt: str = "") -> None:
             await run_chat_turn(ctx.message, prompt, force_new_session=True)
         return
 
-    thread_name = "codex-chat"
+    thread_name = "ai-chat"
     if prompt.strip():
-        thread_name = f"codex-{prompt.strip()[:40]}"
+        thread_name = f"ai-{prompt.strip()[:40]}"
 
     try:
         thread = await ctx.message.create_thread(name=thread_name, auto_archive_duration=1440)
@@ -1993,10 +2223,10 @@ async def codex_status(ctx: commands.Context) -> None:
     elif is_in_codex_category(ctx.channel):
         channel_mode = "project"
     else:
-        channel_mode = "outside-codex-category"
+        channel_mode = "outside-ai-category"
     lines = [
         f"작업 폴더: `{workspace}`",
-        f"Codex 카테고리: `{category.name if category else 'none'}`",
+        f"ai 카테고리: `{category.name if category else 'none'}`",
         f"채널 모드: `{channel_mode}`",
         f"실행 중: `{'yes' if active else 'no'}`",
         f"저장된 세션: `{session_id or 'none'}`",
@@ -2011,6 +2241,7 @@ async def codex_help(ctx: commands.Context) -> None:
         [
             f"`{prefix}codex <요청>`: 새 Codex 작업 실행",
             f"`{prefix}codex-new <프로젝트 이름>`: 프로젝트 폴더와 Discord 채널 생성",
+            f"`{prefix}codex-new <프로젝트 이름> --github --private`: GitHub 저장소 생성 확인까지 요청",
             f"`{prefix}codex-delete`: 현재 프로젝트 채널과 로컬 프로젝트 폴더 삭제 요청",
             f"`{prefix}codex-commit <메시지>`: 확인 이모지 후 현재 채널 작업 폴더 커밋",
             f"`{prefix}codex-push <메시지>`: 확인 이모지 후 커밋하고 GitHub에 푸시",
@@ -2029,11 +2260,11 @@ async def codex_help(ctx: commands.Context) -> None:
         ]
     )
     text += "\n`코덱스야 요청`: 멘션 없이 Codex에게 요청"
-    text += "\n`코덱스야 커밋해줘`, `코덱스야 푸시해줘`: 확인 이모지 후 Git 작업"
-    text += "\n`코덱스야 새 프로젝트 Todo App 만들어줘`: 프로젝트 채널과 로컬 폴더 생성"
-    text += "\n\nCodex 카테고리 안에서는 명령어 없이 바로 대화할 수 있어요."
-    text += "\n`#codex`: 일반 질문 채널"
-    text += "\n그 외 Codex 카테고리 채널: 채널별 프로젝트"
+    text += "\n`코덱스야 커밋해줘`, `코덱스야 푸시해줘`: ✅/❌ 확인 후 Git 작업"
+    text += "\n`코덱스야 Todo App 프로젝트 만들고 GitHub에도 private로 만들어줘`: 프로젝트 채널, 로컬 폴더, GitHub 저장소 생성 요청"
+    text += "\n\nai 카테고리 안에서는 명령어 없이 바로 대화할 수 있어요."
+    text += "\n`#ai`: 일반 질문 채널"
+    text += "\n그 외 ai 카테고리 채널: 채널별 프로젝트"
     await ctx.reply(text, mention_author=False)
 
 
