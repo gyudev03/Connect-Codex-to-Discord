@@ -22,6 +22,7 @@ from discord.ext import commands
 
 DISCORD_MESSAGE_LIMIT = 2000
 MAX_REPLY_CHUNKS = 6
+MAX_CHANGELOG_CHUNKS = 24
 PROJECT_DELETE_CONFIRM_SECONDS = 300
 T = TypeVar("T")
 def load_dotenv(path: Path) -> None:
@@ -167,6 +168,8 @@ class Settings:
     allowed_role_ids: set[int]
     codex_category_id: int | None
     codex_category_name: str
+    changelog_forum_id: int | None
+    changelog_forum_name: str
     general_channel_names: list[str]
     category_chat_enabled: bool
     mention_chat_enabled: bool
@@ -199,6 +202,8 @@ class Settings:
             allowed_role_ids=env_list("DISCORD_ALLOWED_ROLE_IDS"),
             codex_category_id=env_optional_int("DISCORD_CODEX_CATEGORY_ID"),
             codex_category_name=os.environ.get("DISCORD_CODEX_CATEGORY_NAME", "Codex").strip(),
+            changelog_forum_id=env_optional_int("DISCORD_CHANGELOG_FORUM_ID"),
+            changelog_forum_name=os.environ.get("DISCORD_CHANGELOG_FORUM_NAME", "codex-수정내역").strip(),
             general_channel_names=env_text_list("CODEX_GENERAL_CHANNEL_NAMES", "codex"),
             category_chat_enabled=env_bool("CATEGORY_CHAT_ENABLED", True),
             mention_chat_enabled=env_bool("MENTION_CHAT_ENABLED", True),
@@ -266,6 +271,38 @@ class ChatChannelStore:
         return str(channel_id) in self._channel_ids
 
 
+class ChangelogThreadStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._data: dict[str, int] = self._load()
+
+    def _load(self) -> dict[str, int]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+
+        thread_ids: dict[str, int] = {}
+        for key, value in data.items():
+            try:
+                thread_ids[str(key)] = int(value)
+            except (TypeError, ValueError):
+                continue
+        return thread_ids
+
+    def get(self, project_name: str) -> int | None:
+        return self._data.get(normalize_discord_name(project_name))
+
+    def set(self, project_name: str, thread_id: int) -> None:
+        self._data[normalize_discord_name(project_name)] = thread_id
+        self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 @dataclass
 class Project:
     channel_id: int
@@ -278,6 +315,15 @@ class Project:
 class PendingProjectDelete:
     project: Project
     requested_by_id: int
+    created_at: float
+
+
+@dataclass
+class PendingGitAction:
+    action: str
+    workspace: Path
+    requested_by_id: int
+    commit_message: str
     created_at: float
 
 
@@ -491,12 +537,17 @@ class CodexBridge:
 settings = Settings.from_env()
 session_store = SessionStore(Path("data") / "sessions.json")
 chat_channel_store = ChatChannelStore(Path("data") / "chat_channels.json")
+changelog_thread_store = ChangelogThreadStore(Path("data") / "changelog_threads.json")
 project_store = ProjectStore(Path("data") / "projects.json")
 pending_project_deletes: dict[int, PendingProjectDelete] = {}
+pending_git_actions: dict[int, PendingGitAction] = {}
+GIT_CONFIRM_EMOJI = "✅"
+DEFAULT_COMMIT_MESSAGE = "update from Discord Codex"
 bridge = CodexBridge(settings, session_store)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.reactions = True
 bot = commands.Bot(command_prefix=settings.prefix, intents=intents, help_command=None)
 
 
@@ -652,6 +703,92 @@ def find_codex_category(guild: discord.Guild, channel: discord.abc.Messageable) 
     return None
 
 
+async def find_changelog_forum(
+    guild: discord.Guild,
+    channel: discord.abc.Messageable,
+) -> discord.ForumChannel | None:
+    if settings.changelog_forum_id:
+        found = guild.get_channel(settings.changelog_forum_id)
+        if found is None:
+            with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+                found = await guild.fetch_channel(settings.changelog_forum_id)
+        if isinstance(found, discord.ForumChannel):
+            return found
+
+    forum_name = normalize_discord_name(settings.changelog_forum_name)
+    category = find_codex_category(guild, channel)
+    if category:
+        for candidate in category.forums:
+            if normalize_discord_name(candidate.name) == forum_name:
+                return candidate
+
+    for candidate in guild.forums:
+        if normalize_discord_name(candidate.name) == forum_name:
+            return candidate
+
+    return None
+
+
+async def find_changelog_thread(forum: discord.ForumChannel, project_name: str) -> discord.Thread | None:
+    thread_id = changelog_thread_store.get(project_name)
+    if thread_id:
+        cached = bot.get_channel(thread_id)
+        if isinstance(cached, discord.Thread):
+            return cached
+        with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+            fetched = await bot.fetch_channel(thread_id)
+            if isinstance(fetched, discord.Thread):
+                return fetched
+
+    normalized_name = normalize_discord_name(project_name)
+    for thread in forum.threads:
+        if normalize_discord_name(thread.name) == normalized_name:
+            changelog_thread_store.set(project_name, thread.id)
+            return thread
+
+    with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+        async for thread in forum.archived_threads(limit=100):
+            if normalize_discord_name(thread.name) == normalized_name:
+                changelog_thread_store.set(project_name, thread.id)
+                return thread
+
+    return None
+
+
+async def get_or_create_changelog_thread(
+    source_channel: discord.abc.Messageable,
+    project_name: str,
+) -> discord.Thread | None:
+    guild = getattr(source_channel, "guild", None)
+    if not isinstance(guild, discord.Guild):
+        return None
+
+    forum = await find_changelog_forum(guild, source_channel)
+    if forum is None:
+        return None
+
+    thread = await find_changelog_thread(forum, project_name)
+    if thread:
+        if thread.archived:
+            with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+                await thread.edit(archived=False)
+        return thread
+
+    initial_content = f"`{project_name}` 프로젝트 수정내역 포스트입니다."
+    try:
+        created = await forum.create_thread(
+            name=project_name[:100],
+            content=initial_content,
+            allowed_mentions=discord.AllowedMentions.none(),
+            reason=f"Create Codex changelog post for {project_name}",
+        )
+    except (discord.Forbidden, discord.HTTPException):
+        return None
+
+    changelog_thread_store.set(project_name, created.thread.id)
+    return created.thread
+
+
 async def init_git_repo(path: Path) -> str | None:
     if (path / ".git").exists():
         return None
@@ -779,7 +916,9 @@ def channel_context_prompt(message: discord.Message, prompt: str) -> str:
     elif is_general_codex_channel(message.channel):
         context = (
             f"Discord context: This message is from #{channel_name} in the {category_name} category. "
-            "Treat it as the general Codex channel where the user may ask about anything."
+            "Treat it as the general Codex channel where the user may ask about anything. "
+            f"Do not include long examples, stderr/stdout dumps, or detailed change logs in #{channel_name}; "
+            f"project-specific change details belong in the {settings.changelog_forum_name} forum post named after the project."
         )
     else:
         context = (
@@ -1071,6 +1210,273 @@ async def run_with_slow_notice(
             await notice_task
 
 
+async def run_git(workspace: Path, *args: str) -> tuple[int, str, str]:
+    try:
+        process = await asyncio.create_subprocess_exec(
+            "git",
+            *args,
+            cwd=str(workspace),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return 127, "", "git 실행 파일을 찾지 못했어요."
+    except OSError as exc:
+        return 1, "", str(exc)
+
+    stdout, stderr = await process.communicate()
+    return (
+        process.returncode or 0,
+        stdout.decode("utf-8", errors="replace").strip(),
+        stderr.decode("utf-8", errors="replace").strip(),
+    )
+
+
+async def is_git_repo(workspace: Path) -> bool:
+    code, stdout, _ = await run_git(workspace, "rev-parse", "--is-inside-work-tree")
+    return code == 0 and stdout.strip() == "true"
+
+
+async def git_status_short(workspace: Path) -> tuple[int, str, str]:
+    return await run_git(workspace, "status", "--short")
+
+
+async def git_current_branch(workspace: Path) -> str:
+    code, stdout, _ = await run_git(workspace, "branch", "--show-current")
+    if code == 0 and stdout:
+        return stdout
+    return "unknown"
+
+
+def truncate_lines(text: str, max_lines: int = 12) -> str:
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text
+    return "\n".join(lines[:max_lines] + [f"... 외 {len(lines) - max_lines}줄"])
+
+
+def git_request_from_prompt(prompt: str) -> tuple[str, str] | None:
+    normalized = re.sub(r"\s+", "", prompt.strip().lower())
+    if not normalized:
+        return None
+    if any(word in normalized for word in {"차이", "설명", "뭐야", "무엇", "뜻"}):
+        return None
+
+    wants_push = any(word in normalized for word in {"푸시해", "푸쉬해", "push해", "push", "깃허브에올려", "github에올려"})
+    wants_commit = any(word in normalized for word in {"커밋해", "commit해", "commit"})
+    if not wants_push and not wants_commit:
+        return None
+
+    message_match = re.search(r"(?:메시지|message|msg)\s*[:：]?\s*[\"'“”‘’]?(.+?)[\"'“”‘’]?\s*$", prompt, re.IGNORECASE)
+    quote_match = re.search(r"[\"'“”‘’](.+?)[\"'“”‘’]", prompt)
+    commit_message = ""
+    if message_match:
+        commit_message = message_match.group(1).strip()
+    elif quote_match:
+        commit_message = quote_match.group(1).strip()
+
+    if not commit_message:
+        commit_message = DEFAULT_COMMIT_MESSAGE
+
+    return ("push" if wants_push else "commit", commit_message)
+
+
+async def request_git_action(message: discord.Message, action: str, commit_message: str) -> None:
+    if not await is_allowed_message(message):
+        return
+
+    workspace = workspace_for_channel(message.channel)
+    if not workspace.exists():
+        await message.reply(f"작업 폴더를 찾지 못했어요: `{workspace}`", mention_author=False)
+        return
+
+    if not await is_git_repo(workspace):
+        await message.reply(f"이 작업 폴더는 Git 저장소가 아니에요: `{workspace}`", mention_author=False)
+        return
+
+    status_code, status, status_error = await git_status_short(workspace)
+    if status_code != 0:
+        await message.reply(f"`git status` 확인에 실패했어요.\n{status_error or status}", mention_author=False)
+        return
+
+    if action == "commit" and not status:
+        await message.reply("커밋할 변경사항이 없어요.", mention_author=False)
+        return
+
+    branch = await git_current_branch(workspace)
+    action_label = "커밋 후 푸시" if action == "push" else "커밋"
+    status_preview = truncate_lines(status) if status else "변경사항 없음. 그래도 푸시는 진행할 수 있어요."
+    confirm_message = await message.reply(
+        "\n".join(
+            [
+                f"{action_label}을 진행할까요?",
+                f"작업 폴더: `{workspace}`",
+                f"브랜치: `{branch}`",
+                f"커밋 메시지: `{commit_message}`",
+                "",
+                "변경사항:",
+                f"```text\n{status_preview}\n```",
+                f"{GIT_CONFIRM_EMOJI} 반응을 누르면 진행합니다.",
+            ]
+        ),
+        mention_author=False,
+    )
+    try:
+        await confirm_message.add_reaction(GIT_CONFIRM_EMOJI)
+    except discord.HTTPException:
+        await confirm_message.reply("확인 이모지를 달지 못했어요. 봇의 반응 추가 권한을 확인해 주세요.", mention_author=False)
+        return
+
+    pending_git_actions[confirm_message.id] = PendingGitAction(
+        action=action,
+        workspace=workspace,
+        requested_by_id=message.author.id,
+        commit_message=commit_message,
+        created_at=time.time(),
+    )
+
+
+async def git_commit(workspace: Path, commit_message: str) -> tuple[bool, str]:
+    if not await is_git_repo(workspace):
+        return False, f"Git 저장소가 아니에요: `{workspace}`"
+
+    status_code, status, status_error = await git_status_short(workspace)
+    if status_code != 0:
+        return False, f"`git status` 실패:\n{status_error or status}"
+    if not status:
+        return True, "커밋할 변경사항이 없어서 커밋은 건너뛰었어요."
+
+    add_code, add_stdout, add_stderr = await run_git(workspace, "add", "-A")
+    if add_code != 0:
+        return False, f"`git add -A` 실패:\n{add_stderr or add_stdout}"
+
+    commit_code, commit_stdout, commit_stderr = await run_git(workspace, "commit", "-m", commit_message)
+    if commit_code != 0:
+        return False, f"`git commit` 실패:\n{commit_stderr or commit_stdout}"
+
+    hash_code, short_hash, _ = await run_git(workspace, "rev-parse", "--short", "HEAD")
+    suffix = f"\n커밋: `{short_hash}`" if hash_code == 0 and short_hash else ""
+    return True, f"커밋 완료: `{commit_message}`{suffix}"
+
+
+async def git_push(workspace: Path, commit_message: str) -> tuple[bool, str]:
+    commit_ok, commit_text = await git_commit(workspace, commit_message)
+    if not commit_ok:
+        return False, commit_text
+
+    push_code, push_stdout, push_stderr = await run_git(workspace, "push")
+    if push_code != 0:
+        return False, f"{commit_text}\n\n`git push` 실패:\n{push_stderr or push_stdout}"
+
+    detail = push_stdout or push_stderr or "push completed"
+    return True, f"{commit_text}\n\n푸시 완료.\n```text\n{detail}\n```"
+
+
+async def execute_pending_git_action(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    pending = pending_git_actions.pop(reaction.message.id, None)
+    if not pending:
+        return
+    if user.id != pending.requested_by_id:
+        pending_git_actions[reaction.message.id] = pending
+        return
+    if time.time() - pending.created_at > 600:
+        await reaction.message.reply("확인 시간이 지나서 요청을 취소했어요. 다시 요청해 주세요.", mention_author=False)
+        return
+
+    async with reaction.message.channel.typing():
+        if pending.action == "push":
+            ok, text = await git_push(pending.workspace, pending.commit_message)
+        else:
+            ok, text = await git_commit(pending.workspace, pending.commit_message)
+
+    prefix = "완료했어요." if ok else "실패했어요."
+    await reaction.message.reply(f"{prefix}\n{text}", mention_author=False)
+
+
+def changelog_project_name(channel: discord.abc.Messageable) -> str:
+    project = project_for_channel(channel)
+    if project:
+        return project.name
+    if is_general_codex_channel(channel):
+        return settings.workspace.name
+    return getattr(root_channel(channel), "name", settings.workspace.name)
+
+
+def should_route_general_result_to_changelog(
+    message: discord.Message,
+    return_code: int,
+    output: str,
+) -> bool:
+    if not is_in_codex_category(message.channel) or not is_general_codex_channel(message.channel):
+        return False
+    if return_code != 0 or "[stderr]" in output:
+        return True
+
+    prompt = message.content.casefold()
+    output_text = output.casefold()
+    change_words = (
+        "수정",
+        "변경",
+        "반영",
+        "추가",
+        "삭제",
+        "구현",
+        "고쳐",
+        "업데이트",
+        "fix",
+        "change",
+        "update",
+        "implement",
+        "add",
+        "remove",
+        "delete",
+        "refactor",
+    )
+    result_words = ("modified", "updated", "changed", "added", "removed", "수정했", "변경했", "추가했", "반영했")
+    return any(word in prompt for word in change_words) or any(word in output_text for word in result_words)
+
+
+def general_result_notice(thread: discord.Thread | None, return_code: int) -> str:
+    status = "오류 상세" if return_code != 0 else "작업 상세"
+    if thread:
+        return f"{status}는 {thread.mention}에 올렸어요."
+    return f"{status}는 일반 `codex` 채널에 길게 올리지 않았어요. `{settings.changelog_forum_name}` 포럼을 찾거나 쓸 수 있는지 확인해 주세요."
+
+
+async def post_codex_result_to_changelog(
+    message: discord.Message,
+    title: str,
+    return_code: int,
+    output: str,
+) -> discord.Thread | None:
+    project_name = changelog_project_name(message.channel)
+    thread = await get_or_create_changelog_thread(message.channel, project_name)
+    if thread is None:
+        return None
+
+    source = root_channel(message.channel)
+    source_id = getattr(source, "id", None)
+    source_text = f"<#{source_id}>" if isinstance(source_id, int) else getattr(source, "name", "unknown")
+    status = "success" if return_code == 0 else f"exit {return_code}"
+    header = "\n".join(
+        [
+            f"### {title}",
+            f"- 채널: {source_text}",
+            f"- 요청자: {message.author.display_name}",
+            f"- 결과: `{status}`",
+        ]
+    )
+    chunks = as_discord_messages(f"{header}\n\n{output}")
+    for chunk in chunks[:MAX_CHANGELOG_CHUNKS]:
+        await thread.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+    if len(chunks) > MAX_CHANGELOG_CHUNKS:
+        await thread.send(
+            "출력이 길어서 이 포스트에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.",
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    return thread
+
+
 async def send_codex_result(
     anchor: commands.Context | discord.Message,
     title: str,
@@ -1084,6 +1490,11 @@ async def send_codex_result(
 
     if return_code != 0:
         output = f"작업 중 오류가 났어요. 종료 코드: {return_code}\n\n{output}"
+
+    if should_route_general_result_to_changelog(message, return_code, output):
+        thread = await post_codex_result_to_changelog(message, title, return_code, output)
+        await message.reply(general_result_notice(thread, return_code), mention_author=False)
+        return
 
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
@@ -1194,6 +1605,13 @@ async def on_ready() -> None:
 
 
 @bot.event
+async def on_reaction_add(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    if user.bot or str(reaction.emoji) != GIT_CONFIRM_EMOJI:
+        return
+    await execute_pending_git_action(reaction, user)
+
+
+@bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
@@ -1205,6 +1623,10 @@ async def on_message(message: discord.Message) -> None:
 
     if settings.mention_chat_enabled and bot.user and bot.user in message.mentions:
         prompt = strip_bot_mention(message.content)
+        git_request = git_request_from_prompt(prompt)
+        if git_request:
+            await request_git_action(message, *git_request)
+            return
         if await handle_project_delete_message(message, prompt):
             return
         project_name = extract_new_project_name(prompt)
@@ -1216,6 +1638,10 @@ async def on_message(message: discord.Message) -> None:
 
     wake_prompt = strip_wake_word(message.content)
     if wake_prompt is not None:
+        git_request = git_request_from_prompt(wake_prompt)
+        if git_request:
+            await request_git_action(message, *git_request)
+            return
         if await handle_project_delete_message(message, wake_prompt):
             return
         project_name = extract_new_project_name(wake_prompt)
@@ -1226,6 +1652,10 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if settings.category_chat_enabled and is_in_codex_category(message.channel):
+        git_request = git_request_from_prompt(message.content)
+        if git_request:
+            await request_git_action(message, *git_request)
+            return
         if await handle_project_delete_message(message, message.content):
             return
         project_name = extract_new_project_name(message.content)
@@ -1275,6 +1705,18 @@ async def codex_delete(ctx: commands.Context, *, confirmation: str = "") -> None
         await confirm_project_delete(ctx.message)
         return
     await request_project_delete(ctx.message)
+
+
+@bot.command(name="codex-commit")
+async def codex_commit(ctx: commands.Context, *, commit_message: str = "") -> None:
+    commit_message = commit_message.strip() or DEFAULT_COMMIT_MESSAGE
+    await request_git_action(ctx.message, "commit", commit_message)
+
+
+@bot.command(name="codex-push")
+async def codex_push(ctx: commands.Context, *, commit_message: str = "") -> None:
+    commit_message = commit_message.strip() or DEFAULT_COMMIT_MESSAGE
+    await request_git_action(ctx.message, "push", commit_message)
 
 
 @bot.command(name="codex-chat")
@@ -1445,6 +1887,8 @@ async def codex_help(ctx: commands.Context) -> None:
             f"`{prefix}codex <요청>`: 새 Codex 작업 실행",
             f"`{prefix}codex-new <프로젝트 이름>`: 프로젝트 폴더와 Discord 채널 생성",
             f"`{prefix}codex-delete`: 현재 프로젝트 채널과 로컬 프로젝트 폴더 삭제 요청",
+            f"`{prefix}codex-commit <메시지>`: 확인 이모지 후 현재 채널 작업 폴더 커밋",
+            f"`{prefix}codex-push <메시지>`: 확인 이모지 후 커밋하고 GitHub에 푸시",
             f"`{prefix}codex-continue <요청>`: 이 채널의 마지막 Codex 세션에 이어 요청",
             f"`{prefix}codex-resume <세션ID|메시지URL> <요청>`: 특정 세션 재개",
             f"`{prefix}codex-review [지시문]`: 현재 변경사항 리뷰",
@@ -1460,6 +1904,7 @@ async def codex_help(ctx: commands.Context) -> None:
         ]
     )
     text += "\n`코덱스야 요청`: 멘션 없이 Codex에게 요청"
+    text += "\n`코덱스야 커밋해줘`, `코덱스야 푸시해줘`: 확인 이모지 후 Git 작업"
     text += "\n`코덱스야 새 프로젝트 Todo App 만들어줘`: 프로젝트 채널과 로컬 폴더 생성"
     text += "\n\nCodex 카테고리 안에서는 명령어 없이 바로 대화할 수 있어요."
     text += "\n`#codex`: 일반 질문 채널"

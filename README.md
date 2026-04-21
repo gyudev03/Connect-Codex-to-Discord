@@ -7,7 +7,7 @@ Discord 채널에서 로컬 `codex` CLI를 호출해 코딩 작업을 맡기는 
 
 1. Discord Developer Portal에서 봇을 만들고 토큰을 발급합니다.
 2. Bot 설정에서 **Privileged Gateway Intents** 아래의 **Message Content Intent**를 켭니다.
-3. 봇 초대 URL에는 최소 권한으로 `Read Messages/View Channels`, `Send Messages`, `Read Message History`, `Attach Files`를 넣습니다.
+3. 봇 초대 URL에는 최소 권한으로 `Read Messages/View Channels`, `Send Messages`, `Read Message History`, `Attach Files`, `Add Reactions`를 넣습니다.
    프로젝트 채널 자동 생성을 쓰려면 `Manage Channels`도 추가합니다.
 4. 이 PC에서 `codex login`이 완료되어 있어야 합니다.
 
@@ -33,6 +33,8 @@ python bot.py
 
 - `!codex <요청>`: 새 Codex 작업을 실행합니다.
 - `!codex-new <프로젝트 이름>`: `CODEX_PROJECTS_ROOT` 아래에 프로젝트 폴더를 만들고 Codex 카테고리에 채널을 생성합니다.
+- `!codex-commit <메시지>`: 확인 이모지를 누른 뒤 현재 채널의 작업 폴더를 커밋합니다.
+- `!codex-push <메시지>`: 확인 이모지를 누른 뒤 현재 채널의 작업 폴더를 커밋하고 푸시합니다.
 - `!codex-continue <요청>`: 이 채널에 저장된 마지막 Codex 세션을 이어갑니다.
 - `!codex-resume <세션ID|Discord 메시지 URL> <요청>`: 특정 세션을 이어갑니다.
 - `!codex-review [지시문]`: 현재 작업 트리의 변경사항을 리뷰합니다.
@@ -48,6 +50,13 @@ Codex 카테고리의 일반 `#codex` 채널에서는 자연어로도 프로젝�
 ```
 
 그러면 `D:\Coding\Todo App` 같은 폴더와 `#todo-app` 프로젝트 채널이 만들어지고, 이후 해당 채널의 Codex 작업은 그 폴더에서 실행됩니다.
+
+커밋/푸시는 바로 실행되지 않고 봇이 확인 메시지에 `✅` 이모지를 달아 둡니다. 요청한 사용자가 그 이모지를 누르면 실행됩니다.
+
+```text
+코덱스야 커밋해줘
+코덱스야 푸시해줘
+```
 
 ## 설정
 
