@@ -86,7 +86,7 @@ python bot.py
 
 이미지 첨부가 있는 `!codex`/`!codex-continue` 메시지는 첨부 이미지를 `codex exec --image`로 함께 전달합니다.
 
-`GEMINI_REVIEW_ENABLED=true`이고 `GEMINI_BOT_USER_IDS`가 설정되어 있으면 Codex 작업 성공 후, 요청/결과가 코드 변경으로 보이는 경우에만 봇이 `git diff`를 수집해 Gemini 봇을 멘션합니다. Gemini 봇은 Pro 모델로 리뷰하고, 사용 제한이 있으면 Flash 모델로 fallback한 뒤 실제 사용 모델을 답변에 표시합니다. 리뷰가 길면 전체 리뷰를 첨부 파일로 보내며, Codex는 첨부까지 읽어 Gemini 리뷰에 대한 자기 의견과 반영 시 바뀔 점을 함께 보여줍니다. 사용자가 `✅`를 누르면 리뷰를 반영하며 `❌`를 누르면 취소합니다.
+`GEMINI_REVIEW_ENABLED=true`이고 `GEMINI_BOT_USER_IDS`가 설정되어 있으면 Codex 작업 성공 후, 요청/결과가 코드 변경으로 보이는 경우에만 봇이 `git diff`를 수집해 Gemini 봇을 멘션합니다. `!codex-review`는 Codex가 만든 리뷰 결과를 Gemini 봇에 다시 보내 독립 재검토를 요청합니다. Gemini 봇은 Pro 모델로 리뷰하고, 사용 제한이 있으면 Flash 모델로 fallback한 뒤 실제 사용 모델을 답변에 표시합니다. 리뷰가 길면 전체 리뷰를 첨부 파일로 보내며, Codex는 첨부까지 읽어 Gemini 리뷰에 대한 자기 의견과 반영 시 바뀔 점을 함께 보여줍니다. 사용자가 `✅`를 누르면 리뷰를 반영하며 `❌`를 누르면 취소합니다.
 
 ### 프로젝트 관리
 

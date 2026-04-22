@@ -15,6 +15,7 @@ GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 GEMINI_REVIEW_REQUEST_MARKER = "[[GEMINI_REVIEW_REQUEST]]"
 GEMINI_REVIEW_RESULT_MARKER = "[[GEMINI_REVIEW_RESULT]]"
 GEMINI_REVIEW_SKIPPED_MARKER = "[[GEMINI_REVIEW_SKIPPED]]"
+COMPACT_RETRY_CHARS = 12000
 
 
 def load_dotenv(path: Path) -> None:
@@ -89,6 +90,46 @@ def is_rate_limited(status: int, data: dict[str, Any] | None) -> bool:
     return "resource_exhausted" in error_text or "quota" in error_text or "rate" in error_text
 
 
+def api_failure_summary(model: str, status: int, data: dict[str, Any] | None) -> str:
+    if status == 0:
+        return f"{model}: 네트워크 오류 또는 시간 초과"
+    if not isinstance(data, dict):
+        return f"{model}: HTTP {status}, 응답 본문을 읽지 못함"
+
+    error = data.get("error")
+    if isinstance(error, dict):
+        api_status = error.get("status") or "UNKNOWN"
+        message = str(error.get("message") or "").replace("\n", " ")
+        if len(message) > 260:
+            message = message[:260].rstrip() + "..."
+        return f"{model}: HTTP {status} {api_status} - {message}"
+
+    candidates = data.get("candidates")
+    if isinstance(candidates, list) and candidates:
+        reasons = []
+        for candidate in candidates:
+            if isinstance(candidate, dict) and candidate.get("finishReason"):
+                reasons.append(str(candidate["finishReason"]))
+        if reasons:
+            return f"{model}: HTTP {status}, finishReason={', '.join(reasons)}"
+
+    return f"{model}: HTTP {status}, 텍스트 없는 응답"
+
+
+def compact_review_input(review_input: str, limit: int = COMPACT_RETRY_CHARS) -> str:
+    if len(review_input) <= limit:
+        return review_input
+    head_limit = limit * 2 // 3
+    tail_limit = limit - head_limit
+    return "\n\n".join(
+        [
+            review_input[:head_limit].rstrip(),
+            f"... 중간 내용 {len(review_input) - limit}자가 생략됨 ...",
+            review_input[-tail_limit:].lstrip(),
+        ]
+    )
+
+
 class GeminiReviewBot(discord.Client):
     def __init__(self) -> None:
         intents = discord.Intents.default()
@@ -127,11 +168,13 @@ class GeminiReviewBot(discord.Client):
                 )
                 return
 
-            review_text, model_used, fallback_reason = await self.review_with_fallback(review_input)
+            review_text, model_used, fallback_reason, failure_reason = await self.review_with_fallback(review_input)
 
         if not review_text:
             await message.reply(
-                f"{GEMINI_REVIEW_SKIPPED_MARKER}\nGemini 리뷰를 생성하지 못했어요.",
+                f"{GEMINI_REVIEW_SKIPPED_MARKER}\n"
+                "Gemini 리뷰를 생성하지 못했어요.\n"
+                f"원인: {failure_reason or '알 수 없는 응답 오류'}",
                 mention_author=False,
             )
             return
@@ -193,17 +236,34 @@ class GeminiReviewBot(discord.Client):
             review_input = review_input[: self.max_input_chars] + "\n\n... input truncated for Gemini review ..."
         return review_input
 
-    async def review_with_fallback(self, review_input: str) -> tuple[str, str, str | None]:
+    async def review_with_fallback(self, review_input: str) -> tuple[str, str, str | None, str | None]:
         text, status, data = await self.call_gemini(self.model, review_input)
         if text:
-            return text, self.model, None
+            return text, self.model, None, None
+
+        failures = [api_failure_summary(self.model, status, data)]
 
         if self.fallback_model and self.fallback_model != self.model and is_rate_limited(status, data):
-            fallback_text, _, _ = await self.call_gemini(self.fallback_model, review_input)
+            fallback_text, fallback_status, fallback_data = await self.call_gemini(self.fallback_model, review_input)
             if fallback_text:
-                return fallback_text, self.fallback_model, f"{self.model} 사용 제한"
+                return fallback_text, self.fallback_model, f"{self.model} 사용 제한", None
+            failures.append(api_failure_summary(self.fallback_model, fallback_status, fallback_data))
 
-        return "", self.model, None
+            compact_input = compact_review_input(review_input)
+            if compact_input != review_input:
+                compact_text, compact_status, compact_data = await self.call_gemini(self.fallback_model, compact_input)
+                if compact_text:
+                    return (
+                        compact_text,
+                        self.fallback_model,
+                        f"{self.model} 사용 제한, 긴 입력 압축 후 재시도",
+                        None,
+                    )
+                failures.append(
+                    api_failure_summary(f"{self.fallback_model} 압축 재시도", compact_status, compact_data)
+                )
+
+        return "", self.model, None, " / ".join(failures)
 
     async def call_gemini(self, model: str, review_input: str) -> tuple[str, int, dict[str, Any] | None]:
         prompt = "\n".join(
