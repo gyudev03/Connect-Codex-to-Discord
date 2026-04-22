@@ -86,7 +86,7 @@ python bot.py
 
 이미지 첨부가 있는 `!codex`/`!codex-continue` 메시지는 첨부 이미지를 `codex exec --image`로 함께 전달합니다.
 
-`GEMINI_REVIEW_ENABLED=true`이고 `GEMINI_BOT_USER_IDS`가 설정되어 있으면 Codex 작업 성공 후, 요청/결과가 코드 변경으로 보이는 답변에 `GEMINI_REVIEW_EMOJI` 반응을 붙입니다. 요청한 사용자가 그 반응을 누르면 봇이 `git diff`와 Codex 답변을 수집해 Gemini 봇을 멘션합니다. 예전처럼 자동으로 Gemini 리뷰를 요청하려면 `GEMINI_REVIEW_AUTO_REQUEST=true`를 설정하세요. `!codex-review`는 Codex가 만든 리뷰 결과를 Gemini 봇에 다시 보내 독립 재검토를 요청합니다. Gemini 봇은 Pro 모델로 리뷰하고, 사용 제한이 있으면 Flash 모델로 fallback한 뒤 실제 사용 모델을 답변에 표시합니다. 리뷰가 길면 전체 리뷰를 첨부 파일로 보내며, Codex는 첨부까지 읽어 Gemini 리뷰에 대한 자기 의견과 반영 시 바뀔 점을 함께 보여줍니다. 사용자가 `✅`를 누르면 리뷰를 반영하며 `❌`를 누르면 취소합니다.
+`GEMINI_REVIEW_ENABLED=true`이고 `GEMINI_BOT_USER_IDS`가 설정되어 있으면 Codex 작업 성공 후 답변에 `GEMINI_REVIEW_EMOJI` 반응을 붙입니다. 요청한 사용자가 그 반응을 누르면 봇이 Codex 답변을 Gemini 봇에 재검토 요청하고, `git diff`가 있으면 함께 보냅니다. 채팅창이 길어지지 않도록 Gemini에게 보낼 상세 내용은 항상 첨부 파일로 보냅니다. 예전처럼 자동으로 Gemini 리뷰를 요청하려면 `GEMINI_REVIEW_AUTO_REQUEST=true`를 설정하세요. 자동 요청은 코드 변경으로 보이는 답변이나 실제 diff가 있는 답변에만 동작합니다. `!codex-review`는 Codex가 만든 리뷰 결과를 Gemini 봇에 다시 보내 독립 재검토를 요청합니다. Gemini 봇은 기본적으로 Flash 모델로 리뷰하고 실제 사용 모델을 답변에 표시합니다. 리뷰가 길면 전체 리뷰를 첨부 파일로 보내며, Codex는 첨부까지 읽어 Gemini 리뷰에 대한 자기 의견과 반영 시 바뀔 점을 함께 보여줍니다. 사용자가 `✅`를 누르면 리뷰를 반영하며 `❌`를 누르면 취소합니다.
 
 ### 프로젝트 관리
 
@@ -171,8 +171,9 @@ python bot.py
 | `GEMINI_REVIEW_WAIT_SECONDS` | Gemini 리뷰 반영 확인 대기 시간 |
 | `GEMINI_DISCORD_TOKEN` | 별도 Gemini Discord 봇 토큰 |
 | `GEMINI_API_KEY` | Gemini API 키 |
-| `GEMINI_MODEL` | 기본 리뷰 모델. 예: `gemini-2.5-pro` |
+| `GEMINI_MODEL` | 기본 리뷰 모델. 예: `gemini-2.5-flash` |
 | `GEMINI_FALLBACK_MODEL` | 기본 모델 사용 제한 시 대체 리뷰 모델 |
+| `GEMINI_REVIEW_MAX_OUTPUT_TOKENS` | Gemini 리뷰 출력 토큰 한도. 리뷰가 끊기면 늘립니다. 기본값 예: `8192` |
 | `DISCORD_ALLOWED_CHANNEL_IDS` | 허용할 채널 ID 목록. 비워두면 모든 채널 허용 |
 | `DISCORD_ALLOWED_ROLE_IDS` | 허용할 역할 ID 목록. 비워두면 모든 멤버 허용 |
 

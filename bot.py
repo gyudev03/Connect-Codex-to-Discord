@@ -1656,7 +1656,7 @@ async def send_gemini_review_request(
     title: str,
     workspace: Path,
     review_context: str,
-    diff: str,
+    diff: str | None,
 ) -> bool:
     channel_id = getattr(channel, "id", None)
     if not isinstance(channel_id, int):
@@ -1676,29 +1676,37 @@ async def send_gemini_review_request(
     header = "\n".join(
         [
             GEMINI_REVIEW_REQUEST_MARKER,
-            f"<@{gemini_bot_id}> Codex 변경사항을 리뷰해 주세요.",
+            (
+                f"<@{gemini_bot_id}> Codex 변경사항을 리뷰해 주세요."
+                if diff
+                else f"<@{gemini_bot_id}> Codex 답변을 재검토해 주세요."
+            ),
             f"요청자: <@{requested_by_id}>",
             f"작업: `{title}`",
             f"작업 폴더: `{workspace}`",
-            "Codex 답변과 git diff를 함께 보고, 버그, 회귀, 보안/비밀값 노출, 테스트 누락 위주로 봐 주세요.",
-            "Pro 제한이 있으면 Flash fallback을 사용하고, 실제 사용 모델을 답변에 표시해 주세요.",
+            (
+                "Codex 답변과 git diff를 함께 보고, 버그, 회귀, 보안/비밀값 노출, 테스트 누락 위주로 봐 주세요."
+                if diff
+                else "사용자 요청과 Codex 답변을 함께 보고, 틀린 내용, 빠진 전제, 위험한 조언, 더 나은 답변 방향을 봐 주세요."
+            ),
+            "실제 사용 모델을 답변에 표시하고, 설정된 대체 모델이 필요하면 fallback을 사용해 주세요.",
         ]
     )
 
-    content = f"{header}\n\n{review_context}\n\n```diff\n{diff}\n```"
+    content = f"{review_context}"
+    if diff:
+        content = f"{content}\n\n## Git diff\n\n```diff\n{diff}\n```"
     allowed_mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
-    if len(content) <= DISCORD_MESSAGE_LIMIT:
-        await channel.send(content, allowed_mentions=allowed_mentions)
-        return True
 
     review_dir = Path("data") / "gemini_review_requests"
     review_dir.mkdir(parents=True, exist_ok=True)
-    diff_path = review_dir / f"{channel_id}-{int(time.time())}.diff"
-    diff_path.write_text(diff, encoding="utf-8")
-    context_chunks = as_discord_messages(f"{header}\n\n{review_context}\n\nDiff가 길어서 첨부 파일로 보냅니다.")
+    attachment_path = review_dir / f"{channel_id}-{time.time_ns()}-gemini-review-request.md"
+    attachment_path.write_text(content, encoding="utf-8")
+    context_note = "검토할 상세 내용은 첨부 파일로 보냅니다."
+    context_chunks = as_discord_messages(f"{header}\n\n{context_note}")
     await channel.send(
         context_chunks[0],
-        file=discord.File(diff_path),
+        file=discord.File(attachment_path),
         allowed_mentions=allowed_mentions,
     )
     return True
@@ -1715,11 +1723,8 @@ async def request_gemini_review(
         return
     if gemini_review_unavailable_reason():
         return
-    if not result_looks_like_change(source_message, return_code, output):
-        return
-
     diff = await collect_gemini_review_diff(workspace)
-    if not diff:
+    if not diff and not result_looks_like_change(source_message, return_code, output):
         return
 
     await send_gemini_review_request(
@@ -1772,21 +1777,17 @@ async def request_gemini_review_of_codex_review(
             f"작업: `{title}`",
             f"작업 폴더: `{workspace}`",
             "Codex 리뷰에서 빠진 버그, 과한 지적, 보안/비밀값 노출, 테스트 누락 위주로 봐 주세요.",
-            "Pro 제한이 있으면 Flash fallback을 사용하고, 실제 사용 모델을 답변에 표시해 주세요.",
+            "실제 사용 모델을 답변에 표시하고, 설정된 대체 모델이 필요하면 fallback을 사용해 주세요.",
         ]
     )
-    content = f"{header}\n\n## Codex 리뷰 결과\n\n{review_output}"
     allowed_mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
-    if len(content) <= DISCORD_MESSAGE_LIMIT - 50:
-        await source_message.channel.send(content, allowed_mentions=allowed_mentions)
-        return True
 
     review_dir = Path("data") / "gemini_review_requests"
     review_dir.mkdir(parents=True, exist_ok=True)
-    review_path = review_dir / f"{channel_id}-{int(time.time())}-codex-review.md"
+    review_path = review_dir / f"{channel_id}-{time.time_ns()}-codex-review.md"
     review_path.write_text(f"## Codex 리뷰 결과\n\n{review_output}", encoding="utf-8")
     await source_message.channel.send(
-        f"{header}\n\nCodex 리뷰가 길어서 첨부 파일로 보냅니다.",
+        f"{header}\n\nCodex 리뷰 상세 내용은 첨부 파일로 보냅니다.",
         file=discord.File(review_path),
         allowed_mentions=allowed_mentions,
     )
@@ -2204,9 +2205,6 @@ async def execute_pending_gemini_review_trigger(reaction: discord.Reaction, user
 
     async with reaction.message.channel.typing():
         diff = await collect_gemini_review_diff(pending.workspace)
-        if not diff:
-            await reaction.message.reply("Gemini가 리뷰할 git diff가 없어서 요청을 보내지 않았어요.", mention_author=False)
-            return
         requested = await send_gemini_review_request(
             reaction.message.channel,
             pending.requested_by_id,
@@ -2346,11 +2344,6 @@ async def maybe_add_gemini_review_trigger(
         return
     if gemini_review_unavailable_reason():
         return
-    if not result_looks_like_change(source_message, return_code, output):
-        return
-    if not await is_git_repo(workspace):
-        return
-
     pending_gemini_review_triggers[result_message.id] = PendingGeminiReviewTrigger(
         channel_id=result_message.channel.id,
         workspace=workspace,

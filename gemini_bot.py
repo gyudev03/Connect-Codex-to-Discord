@@ -116,6 +116,22 @@ def api_failure_summary(model: str, status: int, data: dict[str, Any] | None) ->
     return f"{model}: HTTP {status}, 텍스트 없는 응답"
 
 
+def gemini_finish_reasons(data: dict[str, Any]) -> list[str]:
+    reasons: list[str] = []
+    candidates = data.get("candidates")
+    if not isinstance(candidates, list):
+        return reasons
+
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate.get("finishReason"):
+            reasons.append(str(candidate["finishReason"]))
+    return reasons
+
+
+def hit_output_token_limit(data: dict[str, Any]) -> bool:
+    return any(reason.upper() == "MAX_TOKENS" for reason in gemini_finish_reasons(data))
+
+
 def compact_review_input(review_input: str, limit: int = COMPACT_RETRY_CHARS) -> str:
     if len(review_input) <= limit:
         return review_input
@@ -139,10 +155,10 @@ class GeminiReviewBot(discord.Client):
 
         self.token = os.environ.get("GEMINI_DISCORD_TOKEN", "").strip()
         self.api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-        self.model = os.environ.get("GEMINI_MODEL", "gemini-2.5-pro").strip() or "gemini-2.5-pro"
+        self.model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
         self.fallback_model = os.environ.get("GEMINI_FALLBACK_MODEL", "gemini-2.5-flash").strip()
         self.max_input_chars = max(1000, env_int("GEMINI_REVIEW_MAX_INPUT_CHARS", 60000))
-        self.max_output_tokens = max(256, env_int("GEMINI_REVIEW_MAX_OUTPUT_TOKENS", 1200))
+        self.max_output_tokens = max(256, env_int("GEMINI_REVIEW_MAX_OUTPUT_TOKENS", 8192))
         self.attachment_max_bytes = max(1024, env_int("GEMINI_REVIEW_ATTACHMENT_MAX_BYTES", 1024 * 1024))
 
         if not self.token:
@@ -309,7 +325,13 @@ class GeminiReviewBot(discord.Client):
 
         if not isinstance(data, dict):
             return "", 200, None
-        return decode_gemini_text(data), 200, data
+        text = decode_gemini_text(data)
+        if text and hit_output_token_limit(data):
+            text += (
+                "\n\n[주의: Gemini가 출력 토큰 한도에 도달해 리뷰가 중간에 끊겼을 수 있어요. "
+                "GEMINI_REVIEW_MAX_OUTPUT_TOKENS를 더 늘려 주세요.]"
+            )
+        return text, 200, data
 
 
 def main() -> None:
