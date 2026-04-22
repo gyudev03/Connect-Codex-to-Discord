@@ -13,6 +13,7 @@ Discord에서 로컬 `codex` CLI를 불러 코딩 작업을 맡기는 브리지 
 - 현재 변경사항 리뷰
 - 확인 이모지 후 커밋/푸시 실행
 - 이미지 첨부를 Codex 입력으로 전달
+- 별도 Gemini 봇과 Discord 안에서 diff 리뷰/승인 흐름 실행
 - 실행 결과와 수정내역을 `ai-수정내역` 포럼에 기록
 - 작업 중단, 상태 확인, 이전 Codex 세션 이어가기
 
@@ -41,6 +42,7 @@ Discord에서 로컬 `codex` CLI를 불러 코딩 작업을 맡기는 브리지 
 4. 프로젝트 채널 자동 생성을 쓰려면 `Manage Channels` 권한도 추가합니다.
 5. 이 PC에서 `codex login`을 완료합니다.
 6. GitHub 저장소 생성이나 푸시를 쓰려면 `gh auth login`도 완료합니다.
+7. Gemini 리뷰 봇을 함께 쓰려면 별도 Discord 봇에도 **Message Content Intent**와 메시지 읽기/쓰기 권한을 켭니다.
 
 ## 설치
 
@@ -54,6 +56,13 @@ Copy-Item .env.example .env
 `.env`를 열고 `DISCORD_TOKEN`을 채웁니다. 필요하면 `CODEX_WORKSPACE`와 `CODEX_PROJECTS_ROOT`를 실제 사용할 경로로 바꿉니다.
 
 ## 실행
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+python run_bots.py
+```
+
+Codex 봇만 따로 실행하려면 다음 명령을 사용합니다.
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
@@ -76,6 +85,8 @@ python bot.py
 | `!codex-cancel` | 현재 채널에서 실행 중인 Codex 작업을 중단합니다. |
 
 이미지 첨부가 있는 `!codex`/`!codex-continue` 메시지는 첨부 이미지를 `codex exec --image`로 함께 전달합니다.
+
+`GEMINI_REVIEW_ENABLED=true`이고 `GEMINI_BOT_USER_IDS`가 설정되어 있으면 Codex 작업 성공 후, 요청/결과가 코드 변경으로 보이는 경우에만 봇이 `git diff`를 수집해 Gemini 봇을 멘션합니다. Gemini 봇은 Pro 모델로 리뷰하고, 사용 제한이 있으면 Flash 모델로 fallback한 뒤 실제 사용 모델을 답변에 표시합니다. 리뷰가 길면 전체 리뷰를 첨부 파일로 보내며, Codex는 첨부까지 읽어 Gemini 리뷰에 대한 자기 의견과 반영 시 바뀔 점을 함께 보여줍니다. 사용자가 `✅`를 누르면 리뷰를 반영하며 `❌`를 누르면 취소합니다.
 
 ### 프로젝트 관리
 
@@ -152,6 +163,14 @@ python bot.py
 | `SLOW_NOTICE_ENABLED` | 작업이 오래 걸릴 때 안내 메시지 표시 여부 |
 | `GITHUB_REPO_OWNER` | GitHub 저장소를 만들 owner. 비워두면 `gh` 로그인 계정 사용 |
 | `GITHUB_DEFAULT_VISIBILITY` | GitHub 저장소 기본 공개 범위. `private`, `public`, `internal` 중 하나 |
+| `GEMINI_REVIEW_ENABLED` | Codex 작업 후 Gemini Discord 봇 리뷰 요청 여부 |
+| `GEMINI_BOT_USER_IDS` | Gemini 리뷰 봇 Discord 사용자 ID 목록 |
+| `GEMINI_REVIEW_MAX_DIFF_CHARS` | Codex 봇이 Gemini 봇에 보낼 diff 최대 글자 수 |
+| `GEMINI_REVIEW_WAIT_SECONDS` | Gemini 리뷰 반영 확인 대기 시간 |
+| `GEMINI_DISCORD_TOKEN` | 별도 Gemini Discord 봇 토큰 |
+| `GEMINI_API_KEY` | Gemini API 키 |
+| `GEMINI_MODEL` | 기본 리뷰 모델. 예: `gemini-2.5-pro` |
+| `GEMINI_FALLBACK_MODEL` | 기본 모델 사용 제한 시 대체 리뷰 모델 |
 | `DISCORD_ALLOWED_CHANNEL_IDS` | 허용할 채널 ID 목록. 비워두면 모든 채널 허용 |
 | `DISCORD_ALLOWED_ROLE_IDS` | 허용할 역할 ID 목록. 비워두면 모든 멤버 허용 |
 

@@ -24,6 +24,24 @@ DISCORD_MESSAGE_LIMIT = 2000
 MAX_REPLY_CHUNKS = 6
 MAX_CHANGELOG_CHUNKS = 24
 PROJECT_DELETE_CONFIRM_SECONDS = 300
+GEMINI_REVIEW_REQUEST_MARKER = "[[GEMINI_REVIEW_REQUEST]]"
+GEMINI_REVIEW_RESULT_MARKER = "[[GEMINI_REVIEW_RESULT]]"
+GEMINI_REVIEW_EXCLUDED_PATHS = {
+    ".env",
+    ".env.local",
+    ".env.development",
+    ".env.production",
+    ".env.test",
+}
+GEMINI_REVIEW_SENSITIVE_NAME_PARTS = (
+    "secret",
+    "token",
+    "credential",
+    "credentials",
+    "apikey",
+    "api_key",
+    "private_key",
+)
 T = TypeVar("T")
 def load_dotenv(path: Path) -> None:
     if not path.exists():
@@ -189,6 +207,10 @@ class Settings:
     slow_notice_seconds: int
     github_repo_owner: str | None
     github_default_visibility: str
+    gemini_review_enabled: bool
+    gemini_bot_user_ids: set[int]
+    gemini_review_max_diff_chars: int
+    gemini_review_wait_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -225,6 +247,10 @@ class Settings:
             slow_notice_seconds=max(1, env_int("SLOW_NOTICE_SECONDS", 12)),
             github_repo_owner=os.environ.get("GITHUB_REPO_OWNER", "").strip() or None,
             github_default_visibility=github_visibility(os.environ.get("GITHUB_DEFAULT_VISIBILITY", "private")),
+            gemini_review_enabled=env_bool("GEMINI_REVIEW_ENABLED", False),
+            gemini_bot_user_ids=env_list("GEMINI_BOT_USER_IDS"),
+            gemini_review_max_diff_chars=max(1000, env_int("GEMINI_REVIEW_MAX_DIFF_CHARS", 12000)),
+            gemini_review_wait_seconds=max(30, env_int("GEMINI_REVIEW_WAIT_SECONDS", 600)),
         )
 
 
@@ -316,6 +342,29 @@ class ChangelogThreadStore:
         self.path.write_text(json.dumps(self._data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+class GeminiReviewStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._items: list[dict[str, object]] = self._load()
+
+    def _load(self) -> list[dict[str, object]]:
+        if not self.path.exists():
+            return []
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
+    def append(self, item: dict[str, object]) -> None:
+        self._items.append(item)
+        self._items = self._items[-200:]
+        self.path.write_text(json.dumps(self._items, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 @dataclass
 class Project:
     channel_id: int
@@ -351,6 +400,26 @@ class PendingGithubRepoAction:
     repo_name: str
     visibility: str
     requested_by_id: int
+    created_at: float
+
+
+@dataclass
+class PendingGeminiReviewRequest:
+    channel_id: int
+    workspace: Path
+    requested_by_id: int
+    title: str
+    created_at: float
+
+
+@dataclass
+class PendingGeminiReviewAction:
+    channel_id: int
+    workspace: Path
+    requested_by_id: int
+    review_text: str
+    codex_opinion: str
+    model_label: str
     created_at: float
 
 
@@ -606,10 +675,13 @@ settings = Settings.from_env()
 session_store = SessionStore(Path("data") / "sessions.json")
 chat_channel_store = ChatChannelStore(Path("data") / "chat_channels.json")
 changelog_thread_store = ChangelogThreadStore(Path("data") / "changelog_threads.json")
+gemini_review_store = GeminiReviewStore(Path("data") / "gemini_reviews.json")
 project_store = ProjectStore(Path("data") / "projects.json")
 pending_project_deletes: dict[int, PendingProjectDelete] = {}
 pending_git_actions: dict[int, PendingGitAction] = {}
 pending_github_repo_actions: dict[int, PendingGithubRepoAction] = {}
+pending_gemini_review_requests: dict[int, PendingGeminiReviewRequest] = {}
+pending_gemini_review_actions: dict[int, PendingGeminiReviewAction] = {}
 GIT_CONFIRM_EMOJI = "✅"
 GIT_CANCEL_EMOJI = "❌"
 DEFAULT_COMMIT_MESSAGE = "update from Discord Codex"
@@ -1393,6 +1465,264 @@ async def run_git(workspace: Path, *args: str) -> tuple[int, str, str]:
     )
 
 
+def is_sensitive_review_path(path_text: str) -> bool:
+    normalized = path_text.replace("\\", "/").strip().lower()
+    name = normalized.rsplit("/", 1)[-1]
+    if name in GEMINI_REVIEW_EXCLUDED_PATHS or name.startswith(".env."):
+        return True
+    return any(part in normalized for part in GEMINI_REVIEW_SENSITIVE_NAME_PARTS)
+
+
+async def git_changed_files(workspace: Path, *args: str) -> list[str]:
+    code, stdout, _ = await run_git(workspace, "diff", "--name-only", "--no-ext-diff", *args)
+    if code != 0 or not stdout:
+        return []
+    return [line.strip() for line in stdout.splitlines() if line.strip()]
+
+
+async def collect_gemini_review_diff(workspace: Path) -> str | None:
+    if not settings.gemini_review_enabled or not settings.gemini_bot_user_ids:
+        return None
+    if not await is_git_repo(workspace):
+        return None
+
+    changed_paths = set(await git_changed_files(workspace))
+    changed_paths.update(await git_changed_files(workspace, "--cached"))
+    safe_changed_paths = sorted(path for path in changed_paths if not is_sensitive_review_path(path))
+
+    sections: list[str] = []
+    if safe_changed_paths:
+        code, stdout, _ = await run_git(workspace, "diff", "--no-ext-diff", "--", *safe_changed_paths)
+        if code == 0 and stdout:
+            sections.append("## Unstaged diff\n\n" + stdout)
+
+        code, stdout, _ = await run_git(workspace, "diff", "--cached", "--no-ext-diff", "--", *safe_changed_paths)
+        if code == 0 and stdout:
+            sections.append("## Staged diff\n\n" + stdout)
+
+    code, stdout, _ = await run_git(workspace, "ls-files", "--others", "--exclude-standard")
+    if code == 0 and stdout:
+        untracked_sections: list[str] = []
+        for relative_path in stdout.splitlines():
+            relative_path = relative_path.strip()
+            if not relative_path or is_sensitive_review_path(relative_path):
+                continue
+
+            file_path = (workspace / relative_path).resolve()
+            try:
+                file_path.relative_to(workspace)
+                content = file_path.read_bytes()
+            except (OSError, ValueError):
+                continue
+            if b"\x00" in content:
+                continue
+
+            text = content[:12000].decode("utf-8", errors="replace")
+            if len(content) > 12000:
+                text += "\n... file truncated for Gemini review ..."
+            untracked_sections.append(f"### {relative_path}\n\n```text\n{text}\n```")
+
+        if untracked_sections:
+            sections.append("## New untracked files\n\n" + "\n\n".join(untracked_sections))
+
+    diff = "\n\n".join(sections).strip()
+    if not diff:
+        return None
+    if len(diff) > settings.gemini_review_max_diff_chars:
+        diff = diff[: settings.gemini_review_max_diff_chars] + "\n\n... diff truncated for Gemini review ..."
+    return diff
+
+
+def gemini_model_label(review_text: str) -> str:
+    match = re.search(r"모델\s*:\s*`?([^`\n]+)`?", review_text)
+    if match:
+        return match.group(1).strip()
+    match = re.search(r"model\s*:\s*`?([^`\n]+)`?", review_text, re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return "unknown"
+
+
+async def gemini_review_text_from_message(message: discord.Message) -> str:
+    parts = [message.content]
+    for attachment in message.attachments:
+        suffix = Path(attachment.filename).suffix.lower()
+        if suffix not in {".txt", ".md", ".diff", ".patch"}:
+            continue
+        if attachment.size > 1024 * 1024:
+            parts.append(f"\n[첨부 {attachment.filename}은 너무 커서 읽지 않았어요.]")
+            continue
+        try:
+            content = await attachment.read()
+        except discord.HTTPException:
+            parts.append(f"\n[첨부 {attachment.filename} 다운로드 실패]")
+            continue
+        if b"\x00" in content:
+            continue
+        parts.append(content.decode("utf-8", errors="replace"))
+    return "\n\n".join(part.strip() for part in parts if part.strip())
+
+
+async def summarize_gemini_review_with_codex(workspace: Path, review_text: str, model_label: str) -> str:
+    prompt = "\n".join(
+        [
+            "Gemini가 아래 코드 리뷰를 남겼습니다.",
+            "사용자가 승인하기 전에 볼 수 있도록 Codex의 의견을 한국어로 짧게 작성해 주세요.",
+            "파일을 수정하지 말고 답변만 작성하세요.",
+            "형식:",
+            "1. Gemini 지적 중 타당해 보이는 점",
+            "2. 반영하면 바뀔 수 있는 것",
+            "3. 주의하거나 건너뛸 수 있는 점",
+            "",
+            f"Gemini 리뷰 모델: {model_label}",
+            "",
+            "Gemini 리뷰:",
+            review_text,
+        ]
+    )
+    return_code, output, _ = await bridge.run_exec(
+        abs(hash((str(workspace), time.time()))),
+        prompt,
+        workspace=workspace,
+    )
+    if return_code != 0:
+        return f"Codex 의견을 만들지 못했어요. 종료 코드: {return_code}\n{output}"
+    return output.strip()
+
+
+async def request_gemini_review(
+    source_message: discord.Message,
+    title: str,
+    return_code: int,
+    output: str,
+    workspace: Path,
+) -> None:
+    if return_code != 0:
+        return
+    if not result_looks_like_change(source_message, return_code, output):
+        return
+
+    diff = await collect_gemini_review_diff(workspace)
+    if not diff:
+        return
+
+    channel_id = getattr(source_message.channel, "id", None)
+    if not isinstance(channel_id, int):
+        return
+
+    gemini_bot_id = next(iter(settings.gemini_bot_user_ids))
+    pending_gemini_review_requests[channel_id] = PendingGeminiReviewRequest(
+        channel_id=channel_id,
+        workspace=workspace,
+        requested_by_id=source_message.author.id,
+        title=title,
+        created_at=time.time(),
+    )
+
+    header = "\n".join(
+        [
+            GEMINI_REVIEW_REQUEST_MARKER,
+            f"<@{gemini_bot_id}> Codex 변경사항을 리뷰해 주세요.",
+            f"요청자: <@{source_message.author.id}>",
+            f"작업: `{title}`",
+            f"작업 폴더: `{workspace}`",
+            "버그, 회귀, 보안/비밀값 노출, 테스트 누락 위주로 봐 주세요.",
+            "Pro 제한이 있으면 Flash fallback을 사용하고, 실제 사용 모델을 답변에 표시해 주세요.",
+        ]
+    )
+
+    allowed_mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    if len(header) + len(diff) + 30 <= DISCORD_MESSAGE_LIMIT:
+        await source_message.channel.send(
+            f"{header}\n\n```diff\n{diff}\n```",
+            allowed_mentions=allowed_mentions,
+        )
+        return
+
+    review_dir = Path("data") / "gemini_review_requests"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    diff_path = review_dir / f"{channel_id}-{int(time.time())}.diff"
+    diff_path.write_text(diff, encoding="utf-8")
+    await source_message.channel.send(
+        f"{header}\n\nDiff가 길어서 첨부 파일로 보냅니다.",
+        file=discord.File(diff_path),
+        allowed_mentions=allowed_mentions,
+    )
+
+
+async def handle_gemini_review_message(message: discord.Message) -> bool:
+    if message.author.id not in settings.gemini_bot_user_ids:
+        return False
+    if GEMINI_REVIEW_RESULT_MARKER not in message.content:
+        return False
+
+    channel_id = getattr(message.channel, "id", None)
+    if not isinstance(channel_id, int):
+        return True
+
+    pending_request = pending_gemini_review_requests.pop(channel_id, None)
+    requested_by_id = pending_request.requested_by_id if pending_request else message.author.id
+    workspace = pending_request.workspace if pending_request else workspace_for_channel(message.channel)
+    title = pending_request.title if pending_request else "Gemini 리뷰"
+    review_text = await gemini_review_text_from_message(message)
+    model_label = gemini_model_label(review_text)
+    async with message.channel.typing():
+        codex_opinion = await summarize_gemini_review_with_codex(workspace, review_text, model_label)
+
+    gemini_review_store.append(
+        {
+            "channel_id": channel_id,
+            "message_id": message.id,
+            "author_id": message.author.id,
+            "requested_by_id": requested_by_id,
+            "workspace": str(workspace),
+            "title": title,
+            "model": model_label,
+            "content": review_text,
+            "codex_opinion": codex_opinion,
+            "created_at": time.time(),
+        }
+    )
+
+    preview = review_text.replace(GEMINI_REVIEW_RESULT_MARKER, "").strip()
+    preview_chunks = split_text(preview, 750)
+    opinion_chunks = split_text(codex_opinion, 750)
+    confirm_message = await message.channel.send(
+        "\n".join(
+            [
+                "Gemini 리뷰가 도착했어요. 이 리뷰를 Codex가 반영할까요?",
+                f"리뷰 모델: `{model_label}`",
+                "",
+                "Codex 의견:",
+                opinion_chunks[0] if opinion_chunks else "(의견 없음)",
+                "",
+                "리뷰 미리보기:",
+                preview_chunks[0] if preview_chunks else "(내용 없음)",
+                "",
+                f"{GIT_CONFIRM_EMOJI} 반응을 누르면 Codex가 리뷰를 반영하고, {GIT_CANCEL_EMOJI} 반응을 누르면 취소합니다.",
+            ]
+        ),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    try:
+        await confirm_message.add_reaction(GIT_CONFIRM_EMOJI)
+        await confirm_message.add_reaction(GIT_CANCEL_EMOJI)
+    except discord.HTTPException:
+        await confirm_message.reply("확인 이모지를 달지 못했어요. 봇의 반응 추가 권한을 확인해 주세요.", mention_author=False)
+        return True
+
+    pending_gemini_review_actions[confirm_message.id] = PendingGeminiReviewAction(
+        channel_id=channel_id,
+        workspace=workspace,
+        requested_by_id=requested_by_id,
+        review_text=review_text,
+        codex_opinion=codex_opinion,
+        model_label=model_label,
+        created_at=time.time(),
+    )
+    return True
+
+
 async def is_git_repo(workspace: Path) -> bool:
     code, stdout, _ = await run_git(workspace, "rev-parse", "--is-inside-work-tree")
     return code == 0 and stdout.strip() == "true"
@@ -1713,6 +2043,65 @@ async def cancel_pending_github_repo_action(reaction: discord.Reaction, user: di
     await reaction.message.reply("GitHub 저장소 생성 요청을 취소했어요.", mention_author=False)
 
 
+async def execute_pending_gemini_review_action(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    pending = pending_gemini_review_actions.pop(reaction.message.id, None)
+    if not pending:
+        return
+    if user.id != pending.requested_by_id:
+        pending_gemini_review_actions[reaction.message.id] = pending
+        return
+    if time.time() - pending.created_at > settings.gemini_review_wait_seconds:
+        await reaction.message.reply("Gemini 리뷰 반영 확인 시간이 지나서 요청을 취소했어요.", mention_author=False)
+        return
+
+    prompt = "\n".join(
+        [
+            "Discord에서 사용자가 Gemini 리뷰 반영을 승인했습니다.",
+            "아래 Gemini 리뷰를 참고해 필요한 코드 변경만 적용해 주세요.",
+            "리뷰가 틀렸거나 이미 반영된 항목은 이유를 짧게 설명하고 건너뛰세요.",
+            f"Gemini 리뷰 모델: {pending.model_label}",
+            "",
+            "승인 전에 작성한 Codex 의견:",
+            pending.codex_opinion,
+            "",
+            "Gemini 리뷰:",
+            pending.review_text,
+        ]
+    )
+    session_id = session_store.get(pending.channel_id)
+    async with reaction.message.channel.typing():
+        return_code, output, new_session_id = await run_with_slow_notice(
+            reaction.message,
+            bridge.run_exec(
+                pending.channel_id,
+                prompt,
+                resume_session_id=session_id,
+                workspace=pending.workspace,
+            ),
+        )
+
+    await send_codex_result_to_channel(
+        reaction.message.channel,
+        "Gemini 리뷰 반영",
+        return_code,
+        output,
+        new_session_id or session_id,
+        source_message=reaction.message,
+        gemini_review_request=False,
+    )
+
+
+async def cancel_pending_gemini_review_action(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    pending = pending_gemini_review_actions.pop(reaction.message.id, None)
+    if not pending:
+        return
+    if user.id != pending.requested_by_id:
+        pending_gemini_review_actions[reaction.message.id] = pending
+        return
+
+    await reaction.message.reply("Gemini 리뷰 반영을 취소했어요.", mention_author=False)
+
+
 def changelog_project_name(channel: discord.abc.Messageable) -> str:
     project = project_for_channel(channel)
     if project:
@@ -1877,6 +2266,8 @@ async def send_codex_result(
     return_code: int,
     output: str,
     session_id: str | None,
+    *,
+    gemini_review_request: bool = True,
 ) -> None:
     message = anchor.message if isinstance(anchor, commands.Context) else anchor
     if session_id:
@@ -1896,6 +2287,8 @@ async def send_codex_result(
             await message.channel.send(chunk)
     if truncated:
         await message.channel.send("출력이 길어서 Discord에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.")
+    if gemini_review_request:
+        await request_gemini_review(message, title, return_code, output, workspace_for_channel(message.channel))
 
 
 async def send_codex_result_to_channel(
@@ -1905,6 +2298,8 @@ async def send_codex_result_to_channel(
     output: str,
     session_id: str | None,
     source_message: discord.Message | None = None,
+    *,
+    gemini_review_request: bool = True,
 ) -> None:
     channel_id = getattr(channel, "id", None)
     if session_id and channel_id is not None:
@@ -1922,6 +2317,8 @@ async def send_codex_result_to_channel(
         await channel.send(chunk)
     if truncated:
         await channel.send("출력이 길어서 Discord에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.")
+    if gemini_review_request and source_message:
+        await request_gemini_review(source_message, title, return_code, output, workspace_for_channel(channel))
 
 
 async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_session: bool = False) -> None:
@@ -2008,14 +2405,18 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.abc.User) ->
     if emoji == GIT_CONFIRM_EMOJI:
         await execute_pending_git_action(reaction, user)
         await execute_pending_github_repo_action(reaction, user)
+        await execute_pending_gemini_review_action(reaction, user)
     elif emoji == GIT_CANCEL_EMOJI:
         await cancel_pending_git_action(reaction, user)
         await cancel_pending_github_repo_action(reaction, user)
+        await cancel_pending_gemini_review_action(reaction, user)
 
 
 @bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
+        if await handle_gemini_review_message(message):
+            return
         return
 
     ctx = await bot.get_context(message)
@@ -2236,7 +2637,7 @@ async def codex_review(ctx: commands.Context, *, prompt: str = "") -> None:
             ctx.message,
             bridge.run_review(ctx.channel.id, prompt.strip(), workspace=workspace_for_channel(ctx.channel)),
         )
-    await send_codex_result(ctx, "Codex 리뷰", return_code, output, None)
+    await send_codex_result(ctx, "Codex 리뷰", return_code, output, None, gemini_review_request=False)
 
 
 @bot.command(name="codex-cancel")
