@@ -209,6 +209,8 @@ class Settings:
     github_default_visibility: str
     gemini_review_enabled: bool
     gemini_bot_user_ids: set[int]
+    gemini_review_auto_request: bool
+    gemini_review_emoji: str
     gemini_review_max_diff_chars: int
     gemini_review_wait_seconds: int
 
@@ -249,6 +251,8 @@ class Settings:
             github_default_visibility=github_visibility(os.environ.get("GITHUB_DEFAULT_VISIBILITY", "private")),
             gemini_review_enabled=env_bool("GEMINI_REVIEW_ENABLED", False),
             gemini_bot_user_ids=env_list("GEMINI_BOT_USER_IDS"),
+            gemini_review_auto_request=env_bool("GEMINI_REVIEW_AUTO_REQUEST", False),
+            gemini_review_emoji=os.environ.get("GEMINI_REVIEW_EMOJI", "🔍").strip() or "🔍",
             gemini_review_max_diff_chars=max(1000, env_int("GEMINI_REVIEW_MAX_DIFF_CHARS", 12000)),
             gemini_review_wait_seconds=max(30, env_int("GEMINI_REVIEW_WAIT_SECONDS", 600)),
         )
@@ -409,6 +413,17 @@ class PendingGeminiReviewRequest:
     workspace: Path
     requested_by_id: int
     title: str
+    created_at: float
+
+
+@dataclass
+class PendingGeminiReviewTrigger:
+    channel_id: int
+    workspace: Path
+    requested_by_id: int
+    title: str
+    source_content: str
+    output: str
     created_at: float
 
 
@@ -681,6 +696,7 @@ pending_project_deletes: dict[int, PendingProjectDelete] = {}
 pending_git_actions: dict[int, PendingGitAction] = {}
 pending_github_repo_actions: dict[int, PendingGithubRepoAction] = {}
 pending_gemini_review_requests: dict[int, PendingGeminiReviewRequest] = {}
+pending_gemini_review_triggers: dict[int, PendingGeminiReviewTrigger] = {}
 pending_gemini_review_actions: dict[int, PendingGeminiReviewAction] = {}
 GIT_CONFIRM_EMOJI = "✅"
 GIT_CANCEL_EMOJI = "❌"
@@ -1619,6 +1635,75 @@ async def summarize_gemini_review_with_codex(workspace: Path, review_text: str, 
     return output.strip()
 
 
+def gemini_review_context(source_content: str, output: str) -> str:
+    clean_source = source_content.strip()
+    if len(clean_source) > 1200:
+        clean_source = clean_source[:1200].rstrip() + "\n\n... user request truncated for Gemini review ..."
+    if not clean_source:
+        clean_source = "(User request was empty or unavailable.)"
+
+    clean_output = output.strip()
+    if len(clean_output) > 4000:
+        clean_output = clean_output[:4000].rstrip() + "\n\n... Codex reply truncated for Gemini review ..."
+    if not clean_output:
+        clean_output = "(Codex reply was empty.)"
+    return f"## 사용자 요청\n\n{clean_source}\n\n## Codex 답변\n\n{clean_output}"
+
+
+async def send_gemini_review_request(
+    channel: discord.abc.Messageable,
+    requested_by_id: int,
+    title: str,
+    workspace: Path,
+    review_context: str,
+    diff: str,
+) -> bool:
+    channel_id = getattr(channel, "id", None)
+    if not isinstance(channel_id, int):
+        return False
+
+    gemini_bot_id = next(iter(settings.gemini_bot_user_ids))
+    created_at = time.time()
+    pending_gemini_review_requests[channel_id] = PendingGeminiReviewRequest(
+        channel_id=channel_id,
+        workspace=workspace,
+        requested_by_id=requested_by_id,
+        title=title,
+        created_at=created_at,
+    )
+    schedule_gemini_review_timeout_notice(channel, channel_id, created_at)
+
+    header = "\n".join(
+        [
+            GEMINI_REVIEW_REQUEST_MARKER,
+            f"<@{gemini_bot_id}> Codex 변경사항을 리뷰해 주세요.",
+            f"요청자: <@{requested_by_id}>",
+            f"작업: `{title}`",
+            f"작업 폴더: `{workspace}`",
+            "Codex 답변과 git diff를 함께 보고, 버그, 회귀, 보안/비밀값 노출, 테스트 누락 위주로 봐 주세요.",
+            "Pro 제한이 있으면 Flash fallback을 사용하고, 실제 사용 모델을 답변에 표시해 주세요.",
+        ]
+    )
+
+    content = f"{header}\n\n{review_context}\n\n```diff\n{diff}\n```"
+    allowed_mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
+    if len(content) <= DISCORD_MESSAGE_LIMIT:
+        await channel.send(content, allowed_mentions=allowed_mentions)
+        return True
+
+    review_dir = Path("data") / "gemini_review_requests"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    diff_path = review_dir / f"{channel_id}-{int(time.time())}.diff"
+    diff_path.write_text(diff, encoding="utf-8")
+    context_chunks = as_discord_messages(f"{header}\n\n{review_context}\n\nDiff가 길어서 첨부 파일로 보냅니다.")
+    await channel.send(
+        context_chunks[0],
+        file=discord.File(diff_path),
+        allowed_mentions=allowed_mentions,
+    )
+    return True
+
+
 async def request_gemini_review(
     source_message: discord.Message,
     title: str,
@@ -1637,49 +1722,13 @@ async def request_gemini_review(
     if not diff:
         return
 
-    channel_id = getattr(source_message.channel, "id", None)
-    if not isinstance(channel_id, int):
-        return
-
-    gemini_bot_id = next(iter(settings.gemini_bot_user_ids))
-    created_at = time.time()
-    pending_gemini_review_requests[channel_id] = PendingGeminiReviewRequest(
-        channel_id=channel_id,
-        workspace=workspace,
-        requested_by_id=source_message.author.id,
-        title=title,
-        created_at=created_at,
-    )
-    schedule_gemini_review_timeout_notice(source_message.channel, channel_id, created_at)
-
-    header = "\n".join(
-        [
-            GEMINI_REVIEW_REQUEST_MARKER,
-            f"<@{gemini_bot_id}> Codex 변경사항을 리뷰해 주세요.",
-            f"요청자: <@{source_message.author.id}>",
-            f"작업: `{title}`",
-            f"작업 폴더: `{workspace}`",
-            "버그, 회귀, 보안/비밀값 노출, 테스트 누락 위주로 봐 주세요.",
-            "Pro 제한이 있으면 Flash fallback을 사용하고, 실제 사용 모델을 답변에 표시해 주세요.",
-        ]
-    )
-
-    allowed_mentions = discord.AllowedMentions(users=True, roles=False, everyone=False)
-    if len(header) + len(diff) + 30 <= DISCORD_MESSAGE_LIMIT:
-        await source_message.channel.send(
-            f"{header}\n\n```diff\n{diff}\n```",
-            allowed_mentions=allowed_mentions,
-        )
-        return
-
-    review_dir = Path("data") / "gemini_review_requests"
-    review_dir.mkdir(parents=True, exist_ok=True)
-    diff_path = review_dir / f"{channel_id}-{int(time.time())}.diff"
-    diff_path.write_text(diff, encoding="utf-8")
-    await source_message.channel.send(
-        f"{header}\n\nDiff가 길어서 첨부 파일로 보냅니다.",
-        file=discord.File(diff_path),
-        allowed_mentions=allowed_mentions,
+    await send_gemini_review_request(
+        source_message.channel,
+        source_message.author.id,
+        title,
+        workspace,
+        gemini_review_context(source_message.content, output),
+        diff,
     )
 
 
@@ -2137,6 +2186,40 @@ async def cancel_pending_github_repo_action(reaction: discord.Reaction, user: di
     await reaction.message.reply("GitHub 저장소 생성 요청을 취소했어요.", mention_author=False)
 
 
+async def execute_pending_gemini_review_trigger(reaction: discord.Reaction, user: discord.abc.User) -> None:
+    pending = pending_gemini_review_triggers.pop(reaction.message.id, None)
+    if not pending:
+        return
+    if user.id != pending.requested_by_id:
+        pending_gemini_review_triggers[reaction.message.id] = pending
+        return
+    if time.time() - pending.created_at > settings.gemini_review_wait_seconds:
+        await reaction.message.reply("Gemini 리뷰 요청 이모지의 대기 시간이 지나서 취소했어요.", mention_author=False)
+        return
+
+    unavailable_reason = gemini_review_unavailable_reason()
+    if unavailable_reason:
+        await reaction.message.reply(f"Gemini 리뷰를 요청하지 못했어요. {unavailable_reason}", mention_author=False)
+        return
+
+    async with reaction.message.channel.typing():
+        diff = await collect_gemini_review_diff(pending.workspace)
+        if not diff:
+            await reaction.message.reply("Gemini가 리뷰할 git diff가 없어서 요청을 보내지 않았어요.", mention_author=False)
+            return
+        requested = await send_gemini_review_request(
+            reaction.message.channel,
+            pending.requested_by_id,
+            pending.title,
+            pending.workspace,
+            gemini_review_context(pending.source_content, pending.output),
+            diff,
+        )
+
+    if not requested:
+        await reaction.message.reply("Gemini 리뷰 요청을 만들지 못했어요.", mention_author=False)
+
+
 async def execute_pending_gemini_review_action(reaction: discord.Reaction, user: discord.abc.User) -> None:
     pending = pending_gemini_review_actions.pop(reaction.message.id, None)
     if not pending:
@@ -2247,6 +2330,40 @@ def should_record_result_to_changelog(
     if project_for_channel(message.channel):
         return True
     return result_looks_like_change(message, return_code, output)
+
+
+async def maybe_add_gemini_review_trigger(
+    result_message: discord.Message | None,
+    source_message: discord.Message,
+    title: str,
+    return_code: int,
+    output: str,
+    workspace: Path,
+) -> None:
+    if result_message is None:
+        return
+    if return_code != 0:
+        return
+    if gemini_review_unavailable_reason():
+        return
+    if not result_looks_like_change(source_message, return_code, output):
+        return
+    if not await is_git_repo(workspace):
+        return
+
+    pending_gemini_review_triggers[result_message.id] = PendingGeminiReviewTrigger(
+        channel_id=result_message.channel.id,
+        workspace=workspace,
+        requested_by_id=source_message.author.id,
+        title=title,
+        source_content=source_message.content,
+        output=output,
+        created_at=time.time(),
+    )
+    try:
+        await result_message.add_reaction(settings.gemini_review_emoji)
+    except discord.HTTPException:
+        pending_gemini_review_triggers.pop(result_message.id, None)
 
 
 def split_stderr_section(output: str) -> tuple[str, str | None]:
@@ -2374,15 +2491,20 @@ async def send_codex_result(
 
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
+    first_result_message: discord.Message | None = None
     for index, chunk in enumerate(chunks[:MAX_REPLY_CHUNKS]):
         if index == 0:
-            await message.reply(chunk, mention_author=False)
+            first_result_message = await message.reply(chunk, mention_author=False)
         else:
             await message.channel.send(chunk)
     if truncated:
         await message.channel.send("출력이 길어서 Discord에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.")
     if gemini_review_request:
-        await request_gemini_review(message, title, return_code, output, workspace_for_channel(message.channel))
+        workspace = workspace_for_channel(message.channel)
+        if settings.gemini_review_auto_request:
+            await request_gemini_review(message, title, return_code, output, workspace)
+        else:
+            await maybe_add_gemini_review_trigger(first_result_message, message, title, return_code, output, workspace)
 
 
 async def send_codex_result_to_channel(
@@ -2407,12 +2529,19 @@ async def send_codex_result_to_channel(
 
     chunks = as_discord_messages(output)
     truncated = len(chunks) > MAX_REPLY_CHUNKS
+    first_result_message: discord.Message | None = None
     for chunk in chunks[:MAX_REPLY_CHUNKS]:
-        await channel.send(chunk)
+        sent = await channel.send(chunk)
+        if first_result_message is None:
+            first_result_message = sent
     if truncated:
         await channel.send("출력이 길어서 Discord에는 일부만 올렸어요. 전체 결과는 Codex 세션/로컬 로그에서 이어 확인해 주세요.")
     if gemini_review_request and source_message:
-        await request_gemini_review(source_message, title, return_code, output, workspace_for_channel(channel))
+        workspace = workspace_for_channel(channel)
+        if settings.gemini_review_auto_request:
+            await request_gemini_review(source_message, title, return_code, output, workspace)
+        else:
+            await maybe_add_gemini_review_trigger(first_result_message, source_message, title, return_code, output, workspace)
 
 
 async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_session: bool = False) -> None:
@@ -2504,6 +2633,8 @@ async def on_reaction_add(reaction: discord.Reaction, user: discord.abc.User) ->
         await cancel_pending_git_action(reaction, user)
         await cancel_pending_github_repo_action(reaction, user)
         await cancel_pending_gemini_review_action(reaction, user)
+    elif emoji == settings.gemini_review_emoji:
+        await execute_pending_gemini_review_trigger(reaction, user)
 
 
 @bot.event
@@ -2810,6 +2941,7 @@ async def codex_help(ctx: commands.Context) -> None:
     )
     text += "\n`코덱스야 요청`: 멘션 없이 Codex에게 요청"
     text += "\n`코덱스야 커밋해줘`, `코덱스야 푸시해줘`: ✅/❌ 확인 후 Git 작업"
+    text += f"\nCodex 답변의 `{settings.gemini_review_emoji}` 반응: Gemini에게 해당 답변과 변경사항 리뷰 요청"
     text += "\n`코덱스야 Todo App 프로젝트 만들고 GitHub에도 private로 만들어줘`: 프로젝트 채널, 로컬 폴더, GitHub 저장소 생성 요청"
     text += "\n\nai 카테고리 안에서는 명령어 없이 바로 대화할 수 있어요."
     text += "\n`#ai`: 일반 질문 채널"
