@@ -419,6 +419,8 @@ class CodexBridge:
         self.session_store = session_store
         self.semaphore = asyncio.Semaphore(settings.max_parallel_jobs)
         self.active_processes: dict[int, asyncio.subprocess.Process] = {}
+        self.active_channels: set[int] = set()
+        self.active_workspaces: dict[int, Path] = {}
 
     def base_args(self) -> list[str]:
         args = [self.settings.codex_command]
@@ -492,6 +494,8 @@ class CodexBridge:
         workspace: Path,
     ) -> tuple[int, str, str | None]:
         if not workspace.exists():
+            if output_path:
+                output_path.unlink(missing_ok=True)
             return (
                 1,
                 "Codex 작업 폴더를 찾지 못했어요.\n"
@@ -501,53 +505,72 @@ class CodexBridge:
             )
 
         async with self.semaphore:
-            try:
-                process = await asyncio.create_subprocess_exec(
-                    *args,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=str(workspace),
-                    creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
-                )
-            except FileNotFoundError:
-                command = args[0]
+            if channel_id in self.active_channels:
+                if output_path:
+                    output_path.unlink(missing_ok=True)
                 return (
-                    127,
-                    "Codex 실행 파일을 찾지 못했어요.\n"
-                    f"현재 CODEX_COMMAND: {command}\n\n"
-                    ".env의 CODEX_COMMAND를 codex.exe 절대경로로 바꿔 주세요. 예:\n"
-                    "CODEX_COMMAND=d:\\Coding\\extensions\\openai.chatgpt-26.417.40842-win32-x64\\bin\\windows-x86_64\\codex.exe",
+                    409,
+                    "이 채널에서 이미 실행 중인 Codex 작업이 있어요.\n"
+                    f"상태 확인: `{settings.prefix}codex-status`\n"
+                    f"중단: `{settings.prefix}codex-cancel`",
                     None,
                 )
-            self.active_processes[channel_id] = process
 
+            self.active_channels.add(channel_id)
+            self.active_workspaces[channel_id] = workspace
             try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(stdin.encode("utf-8")),
-                    timeout=self.settings.timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                self.terminate(channel_id)
-                return 124, f"Codex timed out after {self.settings.timeout_seconds} seconds.", None
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        *args,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=str(workspace),
+                        creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0),
+                    )
+                except FileNotFoundError:
+                    command = args[0]
+                    return (
+                        127,
+                        "Codex 실행 파일을 찾지 못했어요.\n"
+                        f"현재 CODEX_COMMAND: {command}\n\n"
+                        ".env의 CODEX_COMMAND를 codex.exe 절대경로로 바꿔 주세요. 예:\n"
+                        "CODEX_COMMAND=d:\\Coding\\extensions\\openai.chatgpt-26.417.40842-win32-x64\\bin\\windows-x86_64\\codex.exe",
+                        None,
+                    )
+
+                self.active_processes[channel_id] = process
+                try:
+                    try:
+                        stdout, stderr = await asyncio.wait_for(
+                            process.communicate(stdin.encode("utf-8")),
+                            timeout=self.settings.timeout_seconds,
+                        )
+                    except asyncio.TimeoutError:
+                        self.terminate(channel_id)
+                        return 124, f"Codex timed out after {self.settings.timeout_seconds} seconds.", None
+
+                    raw_stdout = stdout.decode("utf-8", errors="replace").strip()
+                    raw_stderr = stderr.decode("utf-8", errors="replace").strip()
+                    session_id = extract_session_id(raw_stdout)
+
+                    final_text = ""
+                    if output_path and output_path.exists():
+                        final_text = output_path.read_text(encoding="utf-8", errors="replace").strip()
+
+                    if not final_text:
+                        final_text = raw_stdout
+                    if raw_stderr:
+                        final_text = f"{final_text}\n\n[stderr]\n{raw_stderr}".strip()
+
+                    return process.returncode or 0, final_text or "(no output)", session_id
+                finally:
+                    self.active_processes.pop(channel_id, None)
             finally:
-                self.active_processes.pop(channel_id, None)
-
-            raw_stdout = stdout.decode("utf-8", errors="replace").strip()
-            raw_stderr = stderr.decode("utf-8", errors="replace").strip()
-            session_id = extract_session_id(raw_stdout)
-
-            final_text = ""
-            if output_path and output_path.exists():
-                final_text = output_path.read_text(encoding="utf-8", errors="replace").strip()
-                output_path.unlink(missing_ok=True)
-
-            if not final_text:
-                final_text = raw_stdout
-            if raw_stderr:
-                final_text = f"{final_text}\n\n[stderr]\n{raw_stderr}".strip()
-
-            return process.returncode or 0, final_text or "(no output)", session_id
+                self.active_channels.discard(channel_id)
+                self.active_workspaces.pop(channel_id, None)
+                if output_path:
+                    output_path.unlink(missing_ok=True)
 
     def terminate(self, channel_id: int) -> bool:
         process = self.active_processes.get(channel_id)
@@ -559,6 +582,24 @@ class CodexBridge:
         else:
             process.terminate()
         return True
+
+    def is_channel_active(self, channel_id: int) -> bool:
+        return channel_id in self.active_channels
+
+    def has_active_workspace_under(self, path: Path) -> bool:
+        try:
+            target = path.expanduser().resolve()
+        except OSError:
+            return False
+
+        for workspace in self.active_workspaces.values():
+            try:
+                active_workspace = workspace.expanduser().resolve()
+                if active_workspace == target or active_workspace.is_relative_to(target):
+                    return True
+            except OSError:
+                continue
+        return False
 
 
 settings = Settings.from_env()
@@ -1127,9 +1168,9 @@ async def request_project_delete(message: discord.Message) -> None:
         await message.reply("프로젝트 삭제는 연결된 프로젝트 채널 안에서만 요청할 수 있어요.", mention_author=False)
         return
 
-    if project.channel_id in bridge.active_processes:
+    if bridge.has_active_workspace_under(project.path):
         await message.reply(
-            f"이 프로젝트 채널에서 실행 중인 Codex 작업이 있어요. 먼저 `{settings.prefix}codex-cancel`로 중단한 뒤 다시 요청해 주세요.",
+            f"이 프로젝트에서 실행 중인 Codex 작업이 있어요. 먼저 `{settings.prefix}codex-cancel`로 중단한 뒤 다시 요청해 주세요.",
             mention_author=False,
         )
         return
@@ -1181,9 +1222,9 @@ async def confirm_project_delete(message: discord.Message) -> None:
         await message.reply("프로젝트 채널을 확인하지 못해서 삭제를 중단했어요.", mention_author=False)
         return
 
-    if project.channel_id in bridge.active_processes:
+    if bridge.has_active_workspace_under(project.path):
         await message.reply(
-            f"이 프로젝트 채널에서 실행 중인 Codex 작업이 있어요. 먼저 `{settings.prefix}codex-cancel`로 중단한 뒤 다시 요청해 주세요.",
+            f"이 프로젝트에서 실행 중인 Codex 작업이 있어요. 먼저 `{settings.prefix}codex-cancel`로 중단한 뒤 다시 요청해 주세요.",
             mention_author=False,
         )
         return
@@ -1262,7 +1303,7 @@ def instant_reply(message: discord.Message, prompt: str) -> str | None:
         )
 
     if normalized in {"상태", "상태확인", "status"}:
-        active = message.channel.id in bridge.active_processes
+        active = bridge.is_channel_active(message.channel.id)
         session_id = session_store.get(message.channel.id)
         workspace = workspace_for_channel(message.channel)
         return "\n".join(
@@ -2211,7 +2252,7 @@ async def codex_cancel(ctx: commands.Context) -> None:
 
 @bot.command(name="codex-status")
 async def codex_status(ctx: commands.Context) -> None:
-    active = ctx.channel.id in bridge.active_processes
+    active = bridge.is_channel_active(ctx.channel.id)
     session_id = session_store.get(ctx.channel.id)
     category = channel_category(ctx.channel)
     workspace = workspace_for_channel(ctx.channel)
