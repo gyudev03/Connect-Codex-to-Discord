@@ -24,6 +24,7 @@ DISCORD_MESSAGE_LIMIT = 2000
 MAX_REPLY_CHUNKS = 6
 MAX_CHANGELOG_CHUNKS = 24
 PROJECT_DELETE_CONFIRM_SECONDS = 300
+REQUEST_ACK_EMOJI = "✅"
 GEMINI_REVIEW_REQUEST_MARKER = "[[GEMINI_REVIEW_REQUEST]]"
 GEMINI_REVIEW_RESULT_MARKER = "[[GEMINI_REVIEW_RESULT]]"
 GEMINI_REVIEW_EXCLUDED_PATHS = {
@@ -1463,29 +1464,21 @@ async def is_allowed(ctx: commands.Context) -> bool:
     return await is_allowed_message(ctx.message)
 
 
-async def send_slow_notice(anchor: discord.Message | discord.abc.Messageable) -> None:
-    if not settings.slow_notice_enabled:
+async def acknowledge_request(message: discord.Message | None) -> None:
+    if message is None:
         return
 
-    await asyncio.sleep(settings.slow_notice_seconds)
-    text = "확인할 내용이 많아서 조금 더 걸릴 수 있어요."
-    if isinstance(anchor, discord.Message):
-        await anchor.reply(text, mention_author=False)
-    else:
-        await anchor.send(text)
+    with contextlib.suppress(discord.HTTPException):
+        await message.add_reaction(REQUEST_ACK_EMOJI)
 
 
-async def run_with_slow_notice(
-    anchor: discord.Message | discord.abc.Messageable,
+async def run_with_acknowledgement(
     awaitable: Awaitable[T],
+    *,
+    acknowledgement_message: discord.Message | None = None,
 ) -> T:
-    notice_task = asyncio.create_task(send_slow_notice(anchor))
-    try:
-        return await awaitable
-    finally:
-        notice_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await notice_task
+    await acknowledge_request(acknowledgement_message)
+    return await awaitable
 
 
 async def run_git(workspace: Path, *args: str) -> tuple[int, str, str]:
@@ -2245,14 +2238,14 @@ async def execute_pending_gemini_review_action(reaction: discord.Reaction, user:
     )
     session_id = session_store.get(pending.channel_id)
     async with reaction.message.channel.typing():
-        return_code, output, new_session_id = await run_with_slow_notice(
-            reaction.message,
+        return_code, output, new_session_id = await run_with_acknowledgement(
             bridge.run_exec(
                 pending.channel_id,
                 prompt,
                 resume_session_id=session_id,
                 workspace=pending.workspace,
             ),
+            acknowledgement_message=reaction.message,
         )
 
     await send_codex_result_to_channel(
@@ -2557,8 +2550,7 @@ async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_sess
 
     async with message.channel.typing():
         if session_id:
-            return_code, output, new_session_id = await run_with_slow_notice(
-                message,
+            return_code, output, new_session_id = await run_with_acknowledgement(
                 bridge.run_exec(
                     message.channel.id,
                     codex_prompt,
@@ -2566,17 +2558,18 @@ async def run_chat_turn(message: discord.Message, prompt: str, *, force_new_sess
                     image_paths=image_paths,
                     workspace=workspace,
                 ),
+                acknowledgement_message=message,
             )
             await send_codex_result(message, "Codex", return_code, output, new_session_id or session_id)
         else:
-            return_code, output, new_session_id = await run_with_slow_notice(
-                message,
+            return_code, output, new_session_id = await run_with_acknowledgement(
                 bridge.run_exec(
                     message.channel.id,
                     codex_prompt,
                     image_paths=image_paths,
                     workspace=workspace,
                 ),
+                acknowledgement_message=message,
             )
             await send_codex_result(message, "Codex", return_code, output, new_session_id)
 
@@ -2698,9 +2691,9 @@ async def codex_command(ctx: commands.Context, *, prompt: str = "") -> None:
     codex_prompt = channel_context_prompt(ctx.message, prompt)
     workspace = workspace_for_channel(ctx.channel)
     async with ctx.channel.typing():
-        return_code, output, session_id = await run_with_slow_notice(
-            ctx.message,
+        return_code, output, session_id = await run_with_acknowledgement(
             bridge.run_exec(ctx.channel.id, codex_prompt, image_paths=image_paths, workspace=workspace),
+            acknowledgement_message=ctx.message,
         )
     await send_codex_result(ctx, "Codex 작업", return_code, output, session_id)
 
@@ -2769,9 +2762,9 @@ async def codex_chat(ctx: commands.Context, *, prompt: str = "") -> None:
         codex_prompt = channel_context_prompt(ctx.message, prompt)
         workspace = workspace_for_channel(thread)
         async with thread.typing():
-            return_code, output, session_id = await run_with_slow_notice(
-                thread,
+            return_code, output, session_id = await run_with_acknowledgement(
                 bridge.run_exec(thread.id, codex_prompt, image_paths=image_paths, workspace=workspace),
+                acknowledgement_message=ctx.message,
             )
         await send_codex_result_to_channel(thread, "Codex", return_code, output, session_id, source_message=ctx.message)
 
@@ -2801,8 +2794,7 @@ async def codex_continue(ctx: commands.Context, *, prompt: str = "") -> None:
     codex_prompt = channel_context_prompt(ctx.message, prompt)
     workspace = workspace_for_channel(ctx.channel)
     async with ctx.channel.typing():
-        return_code, output, new_session_id = await run_with_slow_notice(
-            ctx.message,
+        return_code, output, new_session_id = await run_with_acknowledgement(
             bridge.run_exec(
                 ctx.channel.id,
                 codex_prompt,
@@ -2810,6 +2802,7 @@ async def codex_continue(ctx: commands.Context, *, prompt: str = "") -> None:
                 image_paths=image_paths,
                 workspace=workspace,
             ),
+            acknowledgement_message=ctx.message,
         )
     await send_codex_result(ctx, "Codex 이어하기", return_code, output, new_session_id or session_id)
 
@@ -2832,8 +2825,7 @@ async def codex_resume(ctx: commands.Context, session_id_or_url: str = "", *, pr
     codex_prompt = channel_context_prompt(ctx.message, prompt)
     workspace = workspace_for_channel(ctx.channel)
     async with ctx.channel.typing():
-        return_code, output, new_session_id = await run_with_slow_notice(
-            ctx.message,
+        return_code, output, new_session_id = await run_with_acknowledgement(
             bridge.run_exec(
                 ctx.channel.id,
                 codex_prompt,
@@ -2841,6 +2833,7 @@ async def codex_resume(ctx: commands.Context, session_id_or_url: str = "", *, pr
                 image_paths=image_paths,
                 workspace=workspace,
             ),
+            acknowledgement_message=ctx.message,
         )
     await send_codex_result(ctx, "Codex 세션 재개", return_code, output, new_session_id or session_id)
 
@@ -2851,9 +2844,9 @@ async def codex_review(ctx: commands.Context, *, prompt: str = "") -> None:
         return
 
     async with ctx.channel.typing():
-        return_code, output, _ = await run_with_slow_notice(
-            ctx.message,
+        return_code, output, _ = await run_with_acknowledgement(
             bridge.run_review(ctx.channel.id, prompt.strip(), workspace=workspace_for_channel(ctx.channel)),
+            acknowledgement_message=ctx.message,
         )
     await send_codex_result(ctx, "Codex 리뷰", return_code, output, None, gemini_review_request=False)
     gemini_requested = await request_gemini_review_of_codex_review(
