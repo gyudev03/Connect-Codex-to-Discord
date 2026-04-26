@@ -941,6 +941,16 @@ def find_codex_category(guild: discord.Guild, channel: discord.abc.Messageable) 
     return None
 
 
+async def resolve_text_channel(guild: discord.Guild, channel_id: int) -> discord.TextChannel | None:
+    found = guild.get_channel(channel_id)
+    if found is None:
+        with contextlib.suppress(discord.Forbidden, discord.HTTPException):
+            found = await guild.fetch_channel(channel_id)
+    if isinstance(found, discord.TextChannel):
+        return found
+    return None
+
+
 async def find_changelog_forum(
     guild: discord.Guild,
     channel: discord.abc.Messageable,
@@ -1072,11 +1082,18 @@ async def create_project_from_message(
     existing_channel = discord.utils.get(category.text_channels, name=slug)
     existing_project = project_store.find_by_slug(slug)
     if existing_project:
-        await message.reply(
-            f"이미 연결된 프로젝트가 있어요.\n채널: <#{existing_project.channel_id}>\n경로: `{existing_project.path}`",
-            mention_author=False,
-        )
-        return
+        existing_project_channel = await resolve_text_channel(message.guild, existing_project.channel_id)
+        if existing_project_channel is None:
+            # Drop stale mappings so a project can be recreated as a text channel.
+            project_store.remove(existing_project.channel_id)
+            chat_channel_store.remove(existing_project.channel_id)
+            session_store.remove(existing_project.channel_id)
+        else:
+            await message.reply(
+                f"이미 연결된 프로젝트가 있어요.\n채널: <#{existing_project.channel_id}>\n경로: `{existing_project.path}`",
+                mention_author=False,
+            )
+            return
 
     try:
         project_path = project_path_for_name(project_name)
@@ -1168,9 +1185,9 @@ def channel_context_prompt(message: discord.Message, prompt: str) -> str:
         )
     else:
         context = (
-            f"Discord context: This message is from project channel #{channel_name} "
-            f"in the {category_name} category. Treat this channel as a persistent project named "
-            f"{channel_name}; keep project-specific context, decisions, and follow-up work scoped to it."
+            f"Discord context: This message is from #{channel_name} in the {category_name} category. "
+            "This is a regular channel, not a saved project mapping. Do not treat the category itself as a project; "
+            "only channels explicitly created or linked as projects should get persistent project context."
         )
 
     if isinstance(message.channel, discord.Thread):
@@ -2887,7 +2904,7 @@ async def codex_status(ctx: commands.Context) -> None:
     elif project:
         channel_mode = f"project:{project.name}"
     elif is_in_codex_category(ctx.channel):
-        channel_mode = "project"
+        channel_mode = "ai-category-channel"
     else:
         channel_mode = "outside-ai-category"
     lines = [
