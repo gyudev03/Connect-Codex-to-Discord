@@ -1,3 +1,4 @@
+# 현재 개발 중단 및 Discord_Codex에서 새로 진행 중
 # Connect Codex to Discord
 
 Discord에서 로컬 `codex` CLI를 불러 코딩 작업을 맡기는 브리지 봇입니다.
